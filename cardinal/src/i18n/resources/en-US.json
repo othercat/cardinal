@@ -62,7 +62,11 @@
     "copyFilenames": "Copy Filenames",
     "copyPath": "Copy Path",
     "copyPaths": "Copy Paths",
-    "resetColumnWidths": "Reset Column Widths"
+    "resetColumnWidths": "Reset Column Widths",
+    "excludeFile": "Exclude This File",
+    "excludeDirectory": "Exclude This Folder",
+    "excludePath": "Exclude This Path",
+    "excludeParent": "Exclude Parent Folder"
   },
   "statusBar": {
     "metadataProgress": "Loading sizes and dates {{done}} / {{total}} · unknown values sort last",
@@ -179,8 +183,11 @@
     "action": "Start indexing"
   },
   "ignorePaths": {
-    "label": "Ignore paths",
-    "help": "One path per line; ignored paths are skipped during indexing.",
+    "label": "Excluded paths",
+    "help": "One file or folder per line. Excluding a folder also excludes its contents.",
+    "volumeRules": "Removable volume exclusions",
+    "remove": "Remove",
+    "removeVolumeRule": "Remove {{path}}",
     "errors": {
       "absolute": "Each path must start with '/' or '~'."
     }

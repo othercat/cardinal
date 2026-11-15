@@ -157,12 +157,18 @@ fn begin_sort_request(latest_request: &Mutex<u64>, request_id: u64) -> Option<Ca
 /// non-absolute paths (including relative paths and unsupported `~user` forms).
 /// Returns `Some` absolute path string when valid, otherwise `None`.
 fn normalize_path_input(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    // Right-click rules contain the exact filesystem name; its last component
+    // may end in whitespace. Still accept legacy manually padded inputs.
+    let input = if raw.starts_with('/') || raw.starts_with("~/") {
+        raw
+    } else {
+        raw.trim()
+    };
+    if input.is_empty() {
         return None;
     }
 
-    let path = Path::new(trimmed);
+    let path = Path::new(input);
     let mut expanded = PathBuf::new();
     let home = LazyCell::new(|| {
         std::env::var_os("HOME").and_then(|h| h.to_string_lossy().into_owned().into())
@@ -190,8 +196,8 @@ pub(crate) fn normalize_watch_config(
     include_paths: Vec<String>,
     fallback_watch_root: Option<&str>,
 ) -> Option<(String, Vec<String>, Vec<String>)> {
-    let watch_root = normalize_path_input(watch_root)
-        .or_else(|| fallback_watch_root.and_then(normalize_path_input))?;
+    let watch_root = normalize_path_input(watch_root.trim())
+        .or_else(|| fallback_watch_root.and_then(|root| normalize_path_input(root.trim())))?;
     let mut ignore_paths = ignore_paths
         .into_iter()
         .filter_map(|path| {
@@ -619,6 +625,22 @@ mod tests {
             normalize_path_input(" /var/log "),
             Some("/var/log".to_string())
         );
+    }
+
+    #[test]
+    fn exclusion_rules_preserve_filename_whitespace() {
+        let (root, ignore, include) = normalize_watch_config(
+            " /scope ",
+            vec!["/scope/name ".into(), "/scope/line\n".into()],
+            vec!["/scope/name".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(root, "/scope");
+        assert!(ignore.contains(&"/scope/name ".to_owned()));
+        assert!(ignore.contains(&"/scope/line\n".to_owned()));
+        assert!(!ignore.contains(&"/scope/name".to_owned()));
+        assert_eq!(include, vec!["/scope/name"]);
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { subscribeFSEventsBatch } from '../../runtime/tauriEventRuntime';
 import { useRecentFSEvents } from '../useRecentFSEvents';
+import { eventPathFilter } from '../../utils/pathExclusions';
 
 vi.mock('../../runtime/tauriEventRuntime', () => ({
   subscribeFSEventsBatch: vi.fn(),
@@ -62,6 +63,31 @@ describe('useRecentFSEvents', () => {
     unmount();
 
     expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it('updates existing event rows for exclusions, explicit includes, and undo', () => {
+    const { result, rerender } = renderHook(
+      ({ ignored }: { ignored: string[] }) =>
+        useRecentFSEvents({
+          caseSensitive: true,
+          isActive: true,
+          eventFilterQuery: '',
+          showPath: eventPathFilter(ignored, ['~/src/cache/keep'], '/Users/test'),
+        }),
+      { initialProps: { ignored: [] as string[] } },
+    );
+    const paths = ['cache/other/a', 'cache', 'cache/keep/b', 'cache2/a'].map(
+      (s) => '/Users/test/src/' + s,
+    );
+    act(() =>
+      fsEventsBatchListener?.(
+        paths.map((path, eventId) => ({ path, eventId, timestamp: 1, flagBits: 0 })),
+      ),
+    );
+    rerender({ ignored: ['~/src/cache'] });
+    expect(result.current.filteredEvents.map((e) => e.path)).toEqual(paths.slice(1));
+    rerender({ ignored: [] });
+    expect(result.current.filteredEvents.map((e) => e.path)).toEqual(paths);
   });
 
   it('keeps the last 10,000 raw notifications in order while the Files tab is open', () => {

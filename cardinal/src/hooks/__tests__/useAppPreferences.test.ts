@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OPEN_PREFERENCES_EVENT } from '../../constants/appEvents';
 import { applyThemePreference, persistThemePreference } from '../../theme';
 import { setTrayEnabled } from '../../tray';
@@ -11,6 +11,15 @@ import { useIncludePaths } from '../useIncludePaths';
 import { useWatchRoot } from '../useWatchRoot';
 import { useAppPreferences } from '../useAppPreferences';
 import { invoke } from '@tauri-apps/api/core';
+
+let configApplied: () => void;
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (name: string, cb: () => void) => {
+    if (name === 'watch_config_applied') configApplied = cb;
+    return () => {};
+  }),
+}));
+vi.mock('@tauri-apps/api/path', () => ({ homeDir: async () => '/Users/test' }));
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
@@ -71,6 +80,7 @@ describe('useAppPreferences', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
 
     mockedUseWatchRoot.mockReturnValue({
       watchRoot: '/workspace',
@@ -92,6 +102,73 @@ describe('useAppPreferences', () => {
     mockedSetWatchConfig.mockResolvedValue(undefined);
     mockedInvoke.mockResolvedValue(undefined);
     mockedGetBrowserLanguage.mockReturnValue('fr-FR');
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('serializes two right-clicks, deduplicates the target and preserves deeper includes', async () => {
+    mockedUseIncludePaths.mockReturnValue({
+      includePaths: ['/workspace/a', '/workspace/a/keep'],
+      setIncludePaths,
+      defaultIncludePaths: [],
+    });
+    const { result } = renderHook(() =>
+      useAppPreferences({
+        fullDiskAccessStatus: 'granted',
+        isCheckingFullDiskAccess: false,
+        refreshSearchResults,
+        i18n: { changeLanguage },
+      }),
+    );
+    await act(async () => {
+      result.current.excludePath('/workspace/a');
+      result.current.excludePath('/workspace/a');
+      result.current.excludePath('/workspace/file ');
+      result.current.excludePath('/workspace-other/unrelated');
+    });
+    expect(mockedSetWatchConfig.mock.calls.map(([v]) => v.ignorePaths)).toEqual([
+      ['/Volumes', '/workspace/a'],
+      ['/Volumes', '/workspace/a', '/workspace/file '],
+    ]);
+    expect(setIncludePaths).toHaveBeenLastCalledWith(['/workspace/a/keep']);
+  });
+
+  it('persists offline exclusions by volume identity and relative path on reopening', async () => {
+    window.localStorage.removeItem('cardinal.volumeExclusions');
+    const usePrefs = () =>
+      useAppPreferences({
+        fullDiskAccessStatus: 'granted',
+        isCheckingFullDiskAccess: false,
+        refreshSearchResults,
+        i18n: { changeLanguage },
+      });
+    const first = renderHook(usePrefs);
+    await act(async () => {
+      first.result.current.excludePath('/Volumes/Work/项目', {
+        id: 'first',
+        path: '/Volumes/Work',
+      });
+      first.result.current.excludePath('/Volumes/Work 1/项目', {
+        id: 'first',
+        path: '/Volumes/Work 1',
+      });
+      first.result.current.excludePath('/Volumes/Work/draft', {
+        id: 'second',
+        path: '/Volumes/Work',
+      });
+    });
+    first.unmount();
+    const next = renderHook(usePrefs);
+    expect(
+      next.result.current.volumeExclusions.map(({ volumeId, relativePath }) => [
+        volumeId,
+        relativePath,
+      ]),
+    ).toEqual([
+      ['first', '项目'],
+      ['second', 'draft'],
+    ]);
+    expect(mockedSetWatchConfig).not.toHaveBeenCalled();
+    await act(async () => next.result.current.setVolumeExclusions([]));
   });
 
   it('starts logic once when permission is granted', async () => {
@@ -143,7 +220,7 @@ describe('useAppPreferences', () => {
     mockedSetWatchConfig.mockClear();
     refreshSearchResults.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/tmp',
         ignorePaths: ['/tmp/ignore'],
@@ -158,6 +235,8 @@ describe('useAppPreferences', () => {
       ignorePaths: ['/tmp/ignore'],
       includePaths: [],
     });
+    expect(refreshSearchResults).not.toHaveBeenCalled();
+    act(() => configApplied());
     expect(refreshSearchResults).toHaveBeenCalledTimes(1);
   });
 
@@ -184,7 +263,7 @@ describe('useAppPreferences', () => {
     setWatchRoot.mockClear();
     setIgnorePaths.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/workspace',
         ignorePaths: ['/Volumes'],
@@ -221,7 +300,7 @@ describe('useAppPreferences', () => {
     setWatchRoot.mockClear();
     setIgnorePaths.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/new-root',
         ignorePaths: ['/Volumes'], // same as before
@@ -236,6 +315,8 @@ describe('useAppPreferences', () => {
       ignorePaths: ['/Volumes'],
       includePaths: [],
     });
+    expect(refreshSearchResults).not.toHaveBeenCalled();
+    act(() => configApplied());
     expect(refreshSearchResults).toHaveBeenCalledTimes(1);
   });
 
@@ -262,7 +343,7 @@ describe('useAppPreferences', () => {
     setWatchRoot.mockClear();
     setIgnorePaths.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/workspace', // same as before
         ignorePaths: ['/tmp/ignore'], // different
@@ -277,6 +358,8 @@ describe('useAppPreferences', () => {
       ignorePaths: ['/tmp/ignore'],
       includePaths: [],
     });
+    expect(refreshSearchResults).not.toHaveBeenCalled();
+    act(() => configApplied());
     expect(refreshSearchResults).toHaveBeenCalledTimes(1);
   });
 
@@ -311,7 +394,7 @@ describe('useAppPreferences', () => {
     setWatchRoot.mockClear();
     setIgnorePaths.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/workspace',
         ignorePaths: ['/System', '/Volumes'], // same items, different order
@@ -324,6 +407,8 @@ describe('useAppPreferences', () => {
       ignorePaths: ['/System', '/Volumes'],
       includePaths: [],
     });
+    expect(refreshSearchResults).not.toHaveBeenCalled();
+    act(() => configApplied());
     expect(refreshSearchResults).toHaveBeenCalledTimes(1);
   });
 
@@ -351,7 +436,7 @@ describe('useAppPreferences', () => {
     setIgnorePaths.mockClear();
     setIncludePaths.mockClear();
 
-    act(() => {
+    await act(async () => {
       result.current.handleWatchConfigChange({
         watchRoot: '/workspace',
         ignorePaths: ['/Volumes'],
@@ -365,6 +450,8 @@ describe('useAppPreferences', () => {
       ignorePaths: ['/Volumes'],
       includePaths: ['/Volumes/media'],
     });
+    expect(refreshSearchResults).not.toHaveBeenCalled();
+    act(() => configApplied());
     expect(refreshSearchResults).toHaveBeenCalledTimes(1);
   });
 

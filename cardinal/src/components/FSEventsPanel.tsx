@@ -13,7 +13,7 @@ import type { ListImperativeAPI, RowComponentProps } from 'react-window';
 import { ROW_HEIGHT } from '../constants';
 import { MiddleEllipsisHighlight } from './MiddleEllipsisHighlight';
 import { formatTimestamp } from '../utils/format';
-import { describeEventFlags } from '../utils/eventFlags';
+import { describeEventFlags, FLAG_BITS } from '../utils/eventFlags';
 import type { RecentEventPayload } from '../types/ipc';
 import { useTranslation } from 'react-i18next';
 import { splitPath } from '../utils/path';
@@ -34,7 +34,11 @@ export type FileSystemEvent = RecentEventPayload;
 
 type EventRowContext = {
   events: FileSystemEvent[];
-  onContextMenu: (event: React.MouseEvent<HTMLDivElement>, path: string) => void;
+  onContextMenu: (
+    event: React.MouseEvent<HTMLDivElement>,
+    path: string,
+    isDirectory?: boolean,
+  ) => void;
   searchQuery: string;
   caseInsensitive: boolean;
 };
@@ -62,10 +66,12 @@ const EventRowBase = ({
   const handleContextMenu = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (pathSource) {
-        onContextMenu(e, pathSource);
+        const kind =
+          flagBits & (FLAG_BITS.ITEM_IS_DIR | FLAG_BITS.ITEM_IS_FILE | FLAG_BITS.ITEM_IS_SYMLINK);
+        onContextMenu(e, pathSource, kind ? Boolean(kind & FLAG_BITS.ITEM_IS_DIR) : undefined);
       }
     },
-    [pathSource, onContextMenu],
+    [pathSource, flagBits, onContextMenu],
   );
 
   return (
@@ -99,7 +105,11 @@ const EventRowBase = ({
 type FSEventsPanelProps = {
   events: FileSystemEvent[];
   onResizeStart: (event: React.MouseEvent<HTMLSpanElement>, columnKey: EventColumnKey) => void;
-  onContextMenu: (event: React.MouseEvent<HTMLDivElement>, path: string) => void;
+  onContextMenu: (
+    event: React.MouseEvent<HTMLDivElement>,
+    path: string,
+    isDirectory?: boolean,
+  ) => void;
   onHeaderContextMenu: (event: React.MouseEvent<HTMLDivElement>) => void;
   searchQuery: string;
   caseInsensitive: boolean;

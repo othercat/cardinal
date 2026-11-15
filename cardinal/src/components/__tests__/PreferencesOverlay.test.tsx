@@ -63,6 +63,32 @@ describe('PreferencesOverlay', () => {
     });
   });
 
+  it('round-trips exceptional names as single lines and removes only the selected volume rule on save', () => {
+    const onWatchConfigChange = vi.fn(),
+      onVolumeExclusionsChange = vi.fn();
+    const rules = [{ volumeId: 'one', mountPath: '/Volumes/A', relativePath: 'cache' }];
+    render(
+      <PreferencesOverlay
+        {...baseProps}
+        ignorePaths={['/has\nnewline', '/trailing ']}
+        volumeExclusions={rules}
+        onWatchConfigChange={onWatchConfigChange}
+        onVolumeExclusionsChange={onVolumeExclusionsChange}
+      />,
+    );
+    expect(
+      (screen.getByLabelText('ignorePaths.label') as HTMLTextAreaElement).value.split('\n'),
+    ).toEqual(['"/has\\nnewline"', '"/trailing "']);
+    fireEvent.click(screen.getByText('ignorePaths.remove'));
+    expect(onVolumeExclusionsChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('preferences.save'));
+    expect(onWatchConfigChange.mock.calls[0][0].ignorePaths).toEqual([
+      '/has\nnewline',
+      '/trailing ',
+    ]);
+    expect(onVolumeExclusionsChange).toHaveBeenCalledWith([]);
+  });
+
   it('saves ignore path updates via onWatchConfigChange', () => {
     const onWatchConfigChange = vi.fn();
     render(<PreferencesOverlay {...baseProps} onWatchConfigChange={onWatchConfigChange} />);

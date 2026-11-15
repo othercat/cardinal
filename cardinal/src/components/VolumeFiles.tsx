@@ -3,6 +3,8 @@ import type { ComponentProps } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import Scrollbar from './Scrollbar';
 import { useTranslation } from 'react-i18next';
+import { useContextMenu } from '../hooks/useContextMenu';
+import type { VolumeExclusion } from '../utils/pathExclusions';
 import { FileRow } from './FileRow';
 import { ColumnHeader } from './ColumnHeader';
 import { StateDisplay } from './StateDisplay';
@@ -17,6 +19,8 @@ let serial = 0;
 const nextRequest = () => (serial = Math.max(Date.now() * 1000, serial + 1));
 type Props = {
   volume: VolumeInfo;
+  exclusions: VolumeExclusion[];
+  onExclude: (path: string, volume: VolumeInfo) => void;
   query: string;
   directory: string;
   caseSensitive: boolean;
@@ -26,6 +30,8 @@ type Props = {
 
 export default function VolumeFiles({
   volume,
+  exclusions,
+  onExclude,
   query,
   directory,
   caseSensitive,
@@ -69,9 +75,12 @@ export default function VolumeFiles({
       directoryQuery: directory.trim() || null,
       caseSensitive,
       sort,
+      excludedPaths: exclusions
+        .filter((rule) => rule.volumeId === volume.id)
+        .map((rule) => rule.relativePath),
       requestId: nextRequest(),
     }),
-    [query, directory, caseSensitive, sort, volume.id],
+    [query, directory, caseSensitive, sort, volume.id, exclusions],
   );
   useEffect(() => {
     setScroll(0);
@@ -134,6 +143,7 @@ export default function VolumeFiles({
     },
     [volume.id, volume.online],
   );
+  const { showContextMenu } = useContextMenu(null, undefined, { online: volume.online, open });
   return (
     <div
       className="scroll-area volume-files"
@@ -230,6 +240,15 @@ export default function VolumeFiles({
                         isSelected={selected === item.path}
                         onSelect={() => setSelected(item.path)}
                         onOpen={volume.online ? open : undefined}
+                        onContextMenu={(event, path, _index, isDirectory) => {
+                          setSelected(path);
+                          showContextMenu(event, [path], {
+                            path,
+                            isDirectory,
+                            root: volume.path,
+                            exclude: (p) => onExclude(p, volume),
+                          });
+                        }}
                         allowDrag={false}
                       />
                     )

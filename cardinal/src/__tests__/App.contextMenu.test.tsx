@@ -234,6 +234,10 @@ vi.mock('../hooks/useAppPreferences', () => ({
     defaultWatchRoot: '/',
     ignorePaths: ['/Volumes'],
     defaultIgnorePaths: ['/Volumes'],
+    home: '/Users/test',
+    excludePath: vi.fn(),
+    volumeExclusions: [],
+    includePaths: [],
     preferencesResetToken: 0,
     handleWatchConfigChange: vi.fn(),
     handleResetPreferences: vi.fn(),
@@ -314,6 +318,10 @@ describe('App context menu regression', () => {
     expect(mocks.selectSingleRow).not.toHaveBeenCalled();
     expect(mocks.showFilesContextMenu).toHaveBeenCalledTimes(1);
     expect(mocks.showFilesContextMenu.mock.calls[0][1]).toEqual(['/selected-a', '/selected-b']);
+    expect(mocks.showFilesContextMenu.mock.calls[0][2]).toMatchObject({
+      path: '/clicked',
+      root: '/',
+    });
   });
 
   it('falls back to clicked row path when selected row has no selected paths snapshot', () => {

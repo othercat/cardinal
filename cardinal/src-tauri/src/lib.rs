@@ -267,7 +267,7 @@ fn run_logic_thread(
     if persistence::has_startup_snapshot(db_path) {
         update_app_state(app_handle, AppLifecycleState::LoadingIndex);
     }
-    let mut cache = match persistence::load_startup_cache(
+    let cache = match persistence::load_startup_cache(
         &path,
         db_path,
         &ignore_paths,

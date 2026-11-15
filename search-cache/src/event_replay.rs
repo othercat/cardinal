@@ -93,6 +93,9 @@ pub struct EventPlan {
     ignore: Box<[PathBuf]>,
     include: Box<[PathBuf]>,
     last_event: Option<u64>,
+    // User-entered restoration roots may name a path underneath a symlink.
+    // Only follow the same directories an ordinary walk could have entered.
+    restore_root: Option<PathBuf>,
 }
 
 pub struct EventReplay {
@@ -120,6 +123,16 @@ impl EventReplay {
 }
 
 impl EventPlan {
+    pub(super) fn restore_paths(cache: &SearchCache, paths: &[PathBuf]) -> Self {
+        Self {
+            paths: paths.iter().cloned().map(|path| (path, true)).collect(),
+            ignore: cache.ignore_paths(),
+            include: cache.include_paths(),
+            last_event: None,
+            restore_root: Some(cache.file_nodes.path().to_owned()),
+        }
+    }
+
     pub fn start(self, stop: &'static AtomicBool) -> EventReplay {
         let (tx, rx) = crossbeam_channel::bounded(4);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -139,6 +152,19 @@ impl EventPlan {
         for (path, recursive) in self.paths {
             if cancelled() {
                 return;
+            }
+            if let Some(root) = &self.restore_root {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let mut parent = root.clone();
+                if relative.iter().any(|name| {
+                    let directory = std::fs::symlink_metadata(&parent).is_ok_and(|m| m.is_dir());
+                    parent.push(name);
+                    !directory
+                }) {
+                    continue;
+                }
             }
             match std::fs::symlink_metadata(&path) {
                 Ok(meta) => {
@@ -262,6 +288,7 @@ impl SearchCache {
         );
         Ok(EventPlan {
             paths,
+            restore_root: None,
             ignore: self.ignore_paths(),
             include: self.include_paths(),
             last_event: events.iter().map(|e| e.id).max(),

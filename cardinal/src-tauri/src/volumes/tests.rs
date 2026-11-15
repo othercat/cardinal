@@ -18,6 +18,15 @@ fn fixture_mounts(label: &str) -> Vec<Mount> {
 }
 
 fn rows(source: &Volume, query: &str, sort: Option<SortStatePayload>) -> Vec<serde_json::Value> {
+    scoped_rows(source, query, sort, &[])
+}
+
+fn scoped_rows(
+    source: &Volume,
+    query: &str,
+    sort: Option<SortStatePayload>,
+    excluded: &[&str],
+) -> Vec<serde_json::Value> {
     let request = VolumeQuery {
         query: Some(query.into()),
         directory_query: None,
@@ -26,6 +35,7 @@ fn rows(source: &Volume, query: &str, sort: Option<SortStatePayload>) -> Vec<ser
         offset: 0,
         limit: 256,
         request_id: 1,
+        excluded_paths: excluded.iter().map(PathBuf::from).collect(),
     };
     let reply = do_query(source, request, CancellationToken::noop()).unwrap();
     serde_json::to_value(reply).unwrap()["rows"]
@@ -178,6 +188,7 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
     }
     assert!(!src.meta.lock().info.online);
     assert_eq!(rows(&src, "needle", None).len(), 3);
+    assert_eq!(scoped_rows(&src, "needle", None, &["Nested"]).len(), 1);
     eprintln!("eject and final checkpoint: {:?}", t.elapsed());
 
     let store = Volumes::default();
@@ -215,6 +226,7 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
     fs::write(renamed.join("while-away.txt"), b"new").unwrap();
     let workers = store.reconcile(&cache_dir, fixture_mounts(&label), &notify);
     wait(|| !src.meta.lock().info.indexing && rows(&src, "while-away", None).len() == 1);
+    assert_eq!(scoped_rows(&src, "needle", None, &["Nested"]).len(), 1);
     assert!(
         rows(&src, "needle", None)
             .iter()
@@ -229,6 +241,63 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
     for img in [&a, &b] {
         fs::remove_file(&img.file).unwrap();
     }
+}
+
+#[test]
+fn volume_exclusions_filter_the_whole_order_and_undo_without_disk_access() {
+    use fswalk::Node;
+    fn node(name: &str, children: Vec<Node>) -> Node {
+        Node {
+            name: name.into(),
+            metadata: None,
+            children,
+        }
+    }
+    let tree = node(
+        "Drive",
+        vec![
+            node("cache", vec![node("hit-a", vec![])]),
+            node("cache-old", vec![node("hit-b", vec![])]),
+            node("hit-c", vec![]),
+            node("hit-d", vec![]),
+        ],
+    );
+    let mut index = Index::new(SearchCache::from_volume_tree(
+        Path::new("/Volumes/Absent"),
+        &tree,
+        vec![],
+        1,
+        &APP_QUIT,
+    ));
+    let page = |index: &mut Index, paths: &[&str], offset| {
+        let request = VolumeQuery {
+            query: Some("hit-".into()),
+            directory_query: None,
+            case_sensitive: true,
+            sort: Some(SortStatePayload {
+                key: search_cache::SortKey::Filename,
+                direction: search_cache::SortDirection::Asc,
+            }),
+            offset,
+            limit: 1,
+            request_id: 1,
+            excluded_paths: paths.iter().map(PathBuf::from).collect(),
+        };
+        index
+            .page(request, CancellationToken::noop())
+            .map(|p| serde_json::to_value(p).unwrap())
+    };
+    let excluded = ["cache", "cache/hit-a", "hit-c"];
+    let first = page(&mut index, &excluded, 0).unwrap();
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["rows"][0]["path"], "/Volumes/Absent/cache-old/hit-b");
+    assert_eq!(
+        page(&mut index, &excluded, 1).unwrap()["rows"][0]["path"],
+        "/Volumes/Absent/hit-d"
+    );
+    assert_eq!(page(&mut index, &[], 0).unwrap()["total"], 4);
+    assert!(page(&mut index, &["../other"], 0).is_err());
+    assert!(page(&mut index, &["/Volumes"], 0).is_err());
 }
 
 #[test]
@@ -275,6 +344,7 @@ fn offline_large_volume_sorts_and_pages_every_match_without_accessing_the_mount(
                     offset,
                     limit: 256,
                     request_id: 1,
+                    excluded_paths: vec![],
                 };
                 let json =
                     serde_json::to_value(index.page(request, CancellationToken::noop()).unwrap())

@@ -8,7 +8,21 @@
 
 将应用复制到另一台 M 系列 Mac（例如 M4 Mac mini，macOS 15+）即可使用；目标机首次仍需授予 macOS 文件访问权限。当前使用 ad-hoc 本地签名，没有 Developer ID notarization；跨机首次启动可能需要在系统设置中确认允许打开。分发前核对 Mach-O 架构、最低系统版本、签名、动态库和包内资源，确认没有个人目录或 Homebrew 依赖。
 
-当前版本为 `Cardinal Local 0.1.28`，分发包为 `delivery-root/releases/cardinal-release-r6-20261115.zip`。退出旧 Local 后替换同名应用即可继续使用原来的本机和移动卷索引。
+当前版本为 `Cardinal Local 0.1.29`，分发包为 `delivery-root/releases/cardinal-release-r7-20261115.zip`。退出旧 Local 后替换同名应用即可继续使用原来的本机和移动卷索引。
+
+## r7 的右键排除路径
+
+在「文件」或「事件」中右键点一行，选「排除此文件」或「排除此文件夹」。要排除它所在的目录，打开「排除上级文件夹」并选完整路径。菜单从直接父目录开始，最远可选到监控根目录或移动卷根目录的下一层。多选时，排除操作作用于右键点到的那一行。
+
+规则立即加入「偏好设置 → 排除路径」。本机规则每行一条，移除对应行并保存即可撤销。已建好的索引保留其他路径，撤销时会补扫重新纳入的路径。右键排除会撤销同一路径的显式包含，更深层的包含规则继续有效。移动卷的规则显示在同一区域，可点「移除」后保存。它们按卷身份和卷内路径存储，弹出硬盘后仍可在缓存中排除或恢复结果。
+
+### Spotlight 对文件名搜索的影响
+
+Cardinal 的文件名、路径、大小与时间使用自建索引和 FSEvents。只按文件名查找时，Cardinal 不读取文件正文。显式 `content:` 查询会按需读取候选文件。大范围 `tag:` 查询借助 Spotlight 的 `mdfind`，停用相应卷的索引会影响这类查询的完整性。
+
+macOS 的 `mdutil -s /` 可查看系统盘的索引状态。`mdutil -i off` 和 `mdutil -i on` 可对指定卷停用或恢复 Spotlight 索引，操作通常需要管理员权限。停用普通数据卷的索引通常不会妨碍 macOS 启动或文件读写，但 Finder 搜索和其他依赖 Spotlight 的功能可能漏掉该卷的文件。恢复索引后，系统可能要花数小时甚至数天重建，期间会占用 CPU 和磁盘。[Apple 索引说明](https://support.apple.com/zh-cn/102321) · [Finder 如何使用 Spotlight](https://developer.apple.com/library/archive/documentation/Carbon/Conceptual/MetadataIntro/Concepts/HowDoesItWork.html)
+
+建议保留系统盘索引。只想减少某个高频写入目录或专用移动盘的 Spotlight 工作时，在「系统设置 → 聚焦 → 搜索隐私」中添加该位置，移除即可恢复。Apple 说明，Time Machine 备份盘需要索引，排除整个内置磁盘还会影响 App 更新通知。Cardinal 的右键排除只管理自己的搜索规则。[Apple 搜索隐私说明](https://support.apple.com/zh-sg/guide/mac-help/mchl1bb43b84/mac)
 
 ## r6 的小文件更新频率
 

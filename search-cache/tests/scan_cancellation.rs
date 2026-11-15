@@ -280,7 +280,7 @@ fn noop_cache_signals_do_not_persist() {
 
 #[test]
 fn noop_cache_last_event_id_is_zero() {
-    let mut cache = SearchCache::noop(PathBuf::from("/w"), vec![], vec![], &NEVER_STOPPED);
+    let cache = SearchCache::noop(PathBuf::from("/w"), vec![], vec![], &NEVER_STOPPED);
     assert_eq!(
         cache.last_event_id(),
         0,

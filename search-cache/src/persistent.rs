@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].metadata.as_ref().unwrap().size(), 15);
         restored.flush_to_file(&path).unwrap();
-        let mut final_cache =
+        let final_cache =
             SearchCache::try_read_persistent_cache(&corpus, &path, &[], &[], &NEVER_STOPPED)
                 .unwrap();
         assert_eq!(final_cache.last_event_id(), committed + 1);
