@@ -1,4 +1,13 @@
 {
+  "volumes": {
+    "scope": "搜尋卷宗",
+    "local": "這台 Mac",
+    "online": "已連線",
+    "indexing": "正在建立索引",
+    "offline": "離線快取",
+    "snapshot": "獨立快照",
+    "offlineHint": "離線 · 可搜尋名稱、路徑、大小和日期。重新連接磁碟後可開啟檔案。"
+  },
   "search": {
     "placeholder": {
       "files": "搜尋檔案和資料夾…",

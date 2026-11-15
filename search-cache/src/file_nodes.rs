@@ -12,6 +12,7 @@ pub struct FileNodes {
     include_paths: Vec<PathBuf>,
     slab: ThinSlab<SlabNode>,
     root: SlabIndex,
+    volume_rooted: bool,
 }
 
 impl FileNodes {
@@ -28,6 +29,7 @@ impl FileNodes {
             include_paths,
             slab,
             root,
+            volume_rooted: false,
         }
     }
 
@@ -69,12 +71,31 @@ impl FileNodes {
             segments.push(self.slab.get(current)?.name());
             current = parent;
         }
-        Some(
-            std::iter::once("/")
-                .chain(segments.into_iter().rev())
-                .map(OsStr::new)
-                .collect(),
-        )
+        let mut path = self.tree_root().to_owned();
+        path.extend(segments.into_iter().rev().map(OsStr::new));
+        Some(path)
+    }
+
+    pub(crate) fn tree_root(&self) -> &Path {
+        if self.volume_rooted {
+            &self.path
+        } else {
+            Path::new("/")
+        }
+    }
+
+    pub(crate) fn use_volume_root(&mut self, mount: &Path) {
+        self.volume_rooted = true;
+        self.path = mount.to_owned();
+    }
+
+    pub(crate) fn index_only(&self) -> bool {
+        self.volume_rooted
+    }
+
+    pub(crate) fn set_paths(&mut self, ignore: &[PathBuf], include: &[PathBuf]) {
+        self.ignore_paths = ignore.to_vec();
+        self.include_paths = include.to_vec();
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -112,6 +133,7 @@ impl FileNodes {
             include_paths,
             slab,
             root,
+            volume_rooted: _,
         } = self;
         (path, ignore_paths, include_paths, root, slab)
     }

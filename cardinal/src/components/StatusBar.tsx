@@ -17,6 +17,7 @@ type StatusBarProps = {
   onTabChange: (tab: StatusTabKey) => void;
   onRequestRescan: () => void;
   rescanErrorCount: number;
+  canRescan?: boolean;
 };
 
 const TABS: StatusTabKey[] = ['files', 'events'];
@@ -39,6 +40,7 @@ const StatusBar = ({
   onTabChange,
   onRequestRescan,
   rescanErrorCount,
+  canRescan = true,
 }: StatusBarProps): React.JSX.Element => {
   const { t } = useTranslation();
   const tabsRef = useRef<HTMLDivElement | null>(null);
@@ -91,7 +93,8 @@ const StatusBar = ({
     : resultsText;
   const lifecycleMeta = LIFECYCLE_META[lifecycleState];
   const lifecycleLabel = t(`statusBar.lifecycle.${lifecycleState}`);
-  const rescanDisabled = lifecycleState === 'Initializing' || lifecycleState === 'LoadingIndex';
+  const rescanDisabled =
+    !canRescan || lifecycleState === 'Initializing' || lifecycleState === 'LoadingIndex';
   const rescanTitle = rescanDisabled
     ? t('statusBar.rescan.disabledHint')
     : t('statusBar.rescan.enabledHint');

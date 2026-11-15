@@ -49,8 +49,43 @@ pub(crate) fn load_startup_cache(
     cancel: &'static AtomicBool,
 ) -> Result<SearchCache> {
     let candidate = startup_candidate(db_path)?;
-    let mut cache =
-        SearchCache::try_read_persistent_cache(root, &candidate, ignore, include, cancel)?;
+    let volumes = Path::new("/Volumes");
+    let header = search_cache::read_snapshot_header(&candidate)?;
+    let mut cache = if root == Path::new("/")
+        && ignore.iter().any(|p| p == volumes)
+        && !header.matches_configuration(root, ignore, include)
+    {
+        // r4 allowed explicit /Volumes includes. Only a narrowing of that
+        // subtree may reuse the old database under the new source selection.
+        let mut previous = header.ignore_paths.clone();
+        if !previous.iter().any(|p| p == volumes) {
+            previous.push(volumes.to_owned());
+        }
+        let mut cleaned = header.include_paths.clone();
+        cleaned.retain(|p| !p.starts_with(volumes));
+        let narrowed = search_cache::SnapshotHeader {
+            path: header.path.clone(),
+            ignore_paths: previous,
+            include_paths: cleaned,
+            source_version: header.source_version,
+            last_event_id: header.last_event_id,
+        };
+        ensure!(
+            narrowed.matches_configuration(root, ignore, include),
+            "Snapshot watch configuration does not match"
+        );
+        let mut cache = SearchCache::try_read_persistent_cache(
+            root,
+            &candidate,
+            &header.ignore_paths,
+            &header.include_paths,
+            cancel,
+        )?;
+        cache.exclude_subtree(volumes, ignore, include);
+        cache
+    } else {
+        SearchCache::try_read_persistent_cache(root, &candidate, ignore, include, cancel)?
+    };
     check_event_cursor(cache.last_event_id(), cardinal_sdk::current_event_id())?;
     if candidate != db_path {
         info!("Loaded compatible official snapshot read-only; future saves use Local storage");
@@ -165,6 +200,45 @@ mod tests {
         assert!(check_event_cursor(10, 9).is_err());
         assert!(check_event_cursor(10, 10).is_ok());
         assert!(check_event_cursor(0, 10).is_ok());
+    }
+
+    #[test]
+    fn r4_snapshot_can_drop_the_old_volumes_subtree_without_a_system_scan() {
+        let dir = TestDirectory::new();
+        let file = dir.0.join("index.db");
+        let node = |name: &str, children| fswalk::Node {
+            name: name.into(),
+            children,
+            metadata: None,
+        };
+        let root = node(
+            "/",
+            vec![
+                node("Users", vec![node("local-only", vec![])]),
+                node("Volumes", vec![node("external-only", vec![])]),
+            ],
+        );
+        SearchCache::from_volume_tree(Path::new("/"), &root, vec![], 0, &STOP)
+            .flush_to_file(&file)
+            .unwrap();
+        let cached =
+            load_startup_cache(Path::new("/"), &file, &["/Volumes".into()], &[], &STOP).unwrap();
+        assert!(
+            cached
+                .node_index_for_path(Path::new("/Users/local-only"))
+                .is_some()
+        );
+        assert!(cached.node_index_for_path(Path::new("/Volumes")).is_none());
+        assert!(
+            load_startup_cache(
+                Path::new("/"),
+                &file,
+                &["/Volumes".into(), "/Users".into()],
+                &[],
+                &STOP
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Apple Silicon 构建与搜索优化
 
-关联任务：[#2](../issues/issue-02-apple-silicon-search-performance.md)。本分支仅面向 M 系列芯片、macOS 15.0 及以上。
+本项目面向 M 系列芯片、macOS 15.0 及以上。[本机索引与排序（#2）](../issues/issue-02-apple-silicon-search-performance.md) · [移动卷与离线搜索（#3）](../issues/issue-03-removable-volume-search.md)
 
 ## 独立应用与另一台 Mac
 
@@ -8,7 +8,15 @@
 
 将应用复制到另一台 M 系列 Mac（例如 M4 Mac mini，macOS 15+）即可使用；目标机首次仍需授予 macOS 文件访问权限。当前使用 ad-hoc 本地签名，没有 Developer ID notarization；跨机首次启动可能需要在系统设置中确认允许打开。分发前核对 Mach-O 架构、最低系统版本、签名、动态库和包内资源，确认没有个人目录或 Homebrew 依赖。
 
-当前版本为 `Cardinal Local 0.1.26`，分发包为 `delivery-root/releases/cardinal-release-r4-20261115.zip`。退出旧 Local 后替换同名应用，保留应用数据，直接启动。签名、SHA-256 和实测记录见 Issue #2。
+当前版本为 `Cardinal Local 0.1.27`，分发包为 `delivery-root/releases/cardinal-release-r5-20261115.zip`。退出旧 Local 后替换同名应用即可继续使用 r4 的本机索引。
+
+## r5 的移动硬盘与离线搜索
+
+- 接上移动硬盘后，「文件」页的「搜索卷」会列出卷名，Cardinal 自动为每个卷建立索引。勾选一个卷即可在该卷搜索；取消勾选会用同一关键词搜索本机。系统权限提示出现时，请允许访问需要索引的卷。
+- 首次扫描完成后，弹出硬盘，卷名会标为「离线缓存」。此时仍可搜索文件名、路径、类型、大小和日期，点击列头可对全部匹配结果排序。退出再打开也会记住勾选项。重新接上同一卷后可打开文件，Cardinal 会同步离线期间的变化。
+- 每个卷的索引保存在 Mac 的 `~/Library/Application Support/com.othercat.cardinal/volumes/` 下。有稳定 UUID 的卷改名、换挂载点或与其他卷同名时仍能区分。无法唯一识别的卷会显示为「独立快照」。移动卷缓存记录文件名与属性，`content:` 与 `tag:` 查询仅支持本机搜索。
+- HFS+（含区分大小写的 HFSX）优先用 `searchfs` 批量读取卷目录、大小及时间。系统无法完整返回目录时，会改用按目录枚举。APFS 和其他可识别的本地外置卷使用目录枚举。再次接入时先提供已有索引，有连续的卷事件日志就回放，否则后台重新核对该卷。[Apple HFS Plus Volume Format](https://developer.apple.com/library/archive/technotes/tn/tn1150.html) · [Apple FSEvents](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
+- 在 M1 Pro、macOS 15.7.7 上，HFS+ 映像每次重新挂载后，枚举 16,664 项并组树的五次中位数为 39.164 ms，原有目录遍历为 792.642 ms。映像位于本机 SSD，此项计时只覆盖枚举与组树。实体硬盘的接口、文件数量与缓存状态会影响首次索引时间。
 
 ## r4 的索引恢复和大结果集排序
 

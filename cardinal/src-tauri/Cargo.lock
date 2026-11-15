@@ -388,6 +388,7 @@ dependencies = [
  "base64 0.22.1",
  "camino",
  "cardinal-sdk",
+ "cc",
  "crossbeam-channel",
  "fs-icon",
  "fswalk",

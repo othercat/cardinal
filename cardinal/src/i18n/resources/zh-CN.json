@@ -1,4 +1,13 @@
 {
+  "volumes": {
+    "scope": "搜索卷",
+    "local": "本机",
+    "online": "已连接",
+    "indexing": "正在索引",
+    "offline": "离线缓存",
+    "snapshot": "独立快照",
+    "offlineHint": "离线 · 可搜索名称、路径、大小和日期。重新连接硬盘后可打开文件。"
+  },
   "search": {
     "placeholder": {
       "files": "搜索文件和文件夹…",

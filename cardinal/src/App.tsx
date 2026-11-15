@@ -1,4 +1,7 @@
-import { useRef, useCallback, useEffect, useMemo } from 'react';
+import { useRef, useCallback, useEffect, useMemo, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import VolumeFiles from './components/VolumeFiles';
+import { useVolumes } from './hooks/useVolumes';
 import type { ChangeEvent, CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import './App.css';
 import { FileRow } from './components/FileRow';
@@ -32,6 +35,8 @@ import { useFilesTabEffects } from './hooks/useFilesTabEffects';
 import { useFilesTabState } from './hooks/useFilesTabState';
 
 function App() {
+  const { volumes, selected: volume, select: selectVolume } = useVolumes();
+  const [volumeCount, setVolumeCount] = useState<{ matched: number; indexed: number } | null>(null);
   const {
     state,
     searchParams,
@@ -44,7 +49,7 @@ function App() {
     requestRescan,
     pendingSortRef,
     activeSortKey,
-  } = useFileSearch();
+  } = useFileSearch(!volume);
   const {
     results,
     resultsVersion,
@@ -126,13 +131,17 @@ function App() {
   });
 
   const navigateFromSearchToResults = useCallback(() => {
+    if (volume) {
+      document.querySelector<HTMLElement>('.volume-files')?.focus();
+      return;
+    }
     if (displayedResults.length === 0) {
       return;
     }
 
     selectSingleRow(0);
     searchInputRef.current?.blur();
-  }, [displayedResults.length, selectSingleRow]);
+  }, [volume, displayedResults.length, selectSingleRow]);
 
   const {
     activeTab,
@@ -247,7 +256,7 @@ function App() {
   const triggerQuickLook = useStableEvent(toggleQuickLook);
 
   useAppHotkeys({
-    activeTab,
+    activeTab: volume && activeTab === 'files' ? 'volume' : activeTab,
     activeRowIndex,
     selectedPaths,
     selectedIndicesRef,
@@ -422,6 +431,37 @@ function App() {
           onBlur={handleSearchBlur}
         />
         <div className={resultsContainerClassName} style={containerStyle}>
+          {activeTab === 'files' && volumes.length > 0 && (
+            <div className="volume-selector" role="group" aria-label={t('volumes.scope')}>
+              <span>{volume ? t('volumes.scope') : t('volumes.local')}</span>
+              {volumes.map((v) => (
+                <label key={v.id} title={v.path + ' · ' + v.id}>
+                  <input
+                    type="checkbox"
+                    checked={v.id === volume?.id}
+                    onChange={(e) => {
+                      clearSelection();
+                      closeQuickLook();
+                      setVolumeCount(null);
+                      selectVolume(e.target.checked ? v : null);
+                    }}
+                  />
+                  {v.path.split('/').pop()}
+                  {volumes.some((other) => other.id !== v.id && other.path === v.path) &&
+                    ` (${v.id.slice(0, 8)})`}
+                  {' · '}
+                  {t(
+                    v.online
+                      ? v.indexing
+                        ? 'volumes.indexing'
+                        : 'volumes.online'
+                      : 'volumes.offline',
+                  )}
+                  {!v.reusable && ' · ' + t('volumes.snapshot')}
+                </label>
+              ))}
+            </div>
+          )}
           {activeTab === 'events' && (
             <FSEventsPanel
               ref={eventsPanelRef}
@@ -434,45 +474,64 @@ function App() {
             />
           )}
           <div className="files-tab-pane" hidden={activeTab !== 'files'}>
-            <FilesTabContent
-              headerRef={headerRef}
-              onResizeStart={onResizeStart}
-              onHeaderContextMenu={showFilesHeaderContextMenu}
-              displayState={displayState}
-              searchErrorMessage={searchErrorMessage}
-              currentQuery={currentQuery}
-              currentDirectoryQuery={currentDirectoryQuery}
-              virtualListRef={virtualListRef}
-              results={displayedResults}
-              pages={displayedPages}
-              dataResultsVersion={displayedDataVersion}
-              displayedResultsVersion={displayedResultsVersion}
-              queryVersion={queryVersion}
-              fileChanges={displayedFileChanges}
-              changedIds={displayedChangedIds}
-              rowHeight={ROW_HEIGHT}
-              overscan={OVERSCAN_ROW_COUNT}
-              renderRow={renderRow}
-              onScrollSync={handleHorizontalSync}
-              isSorting={isSorting}
-              sortState={sortState}
-              onSortToggle={handleSortToggle}
-              sortDisabled={sortButtonsDisabled}
-              sortDisabledTooltip={sortDisabledTooltip}
-            />
+            {volume ? (
+              <VolumeFiles
+                key={volume.id}
+                volume={volume}
+                query={searchParams.query}
+                directory={directoryScopeOpen ? directoryQuery : ''}
+                caseSensitive={caseSensitive}
+                onResizeStart={onResizeStart}
+                onCount={setVolumeCount}
+              />
+            ) : (
+              <FilesTabContent
+                headerRef={headerRef}
+                onResizeStart={onResizeStart}
+                onHeaderContextMenu={showFilesHeaderContextMenu}
+                displayState={displayState}
+                searchErrorMessage={searchErrorMessage}
+                currentQuery={currentQuery}
+                currentDirectoryQuery={currentDirectoryQuery}
+                virtualListRef={virtualListRef}
+                results={displayedResults}
+                pages={displayedPages}
+                dataResultsVersion={displayedDataVersion}
+                displayedResultsVersion={displayedResultsVersion}
+                queryVersion={queryVersion}
+                fileChanges={displayedFileChanges}
+                changedIds={displayedChangedIds}
+                rowHeight={ROW_HEIGHT}
+                overscan={OVERSCAN_ROW_COUNT}
+                renderRow={renderRow}
+                onScrollSync={handleHorizontalSync}
+                isSorting={isSorting}
+                sortState={sortState}
+                onSortToggle={handleSortToggle}
+                sortDisabled={sortButtonsDisabled}
+                sortDisabledTooltip={sortDisabledTooltip}
+              />
+            )}
           </div>
         </div>
         <StatusBar
-          metadata={state.metadata}
-          scannedFiles={scannedFiles}
+          metadata={volume ? undefined : state.metadata}
+          scannedFiles={volume ? (volume.count ?? volumeCount?.indexed ?? 0) : scannedFiles}
           processedEvents={processedEvents}
-          lifecycleState={lifecycleState}
-          searchDurationMs={durationMs}
-          resultCount={resultCount}
+          lifecycleState={volume ? (volume.indexing ? 'Updating' : 'Ready') : lifecycleState}
+          searchDurationMs={volume ? null : durationMs}
+          resultCount={volume ? (volumeCount?.matched ?? null) : resultCount}
           activeTab={activeTab}
           onTabChange={onTabChange}
-          onRequestRescan={requestRescan}
-          rescanErrorCount={rescanErrors}
+          onRequestRescan={
+            volume
+              ? () => {
+                  void invoke('rescan_volume', { id: volume.id });
+                }
+              : requestRescan
+          }
+          canRescan={!volume || (volume.online && !volume.indexing)}
+          rescanErrorCount={volume ? Number(!!volume.error) : rescanErrors}
         />
       </main>
       <PreferencesOverlay

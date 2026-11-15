@@ -6,6 +6,13 @@ import type { RecentEventPayload } from '../types/ipc';
 import type { SortKey } from '../types/sort';
 
 const events = vi.hoisted(() => ({ emit: (_events: RecentEventPayload[]) => {} }));
+const mounts = vi.hoisted(() => ({ changed: () => {} }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: async (_: string, cb: () => void) => {
+    mounts.changed = cb;
+    return () => {};
+  },
+}));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('../runtime/tauriEventRuntime', () => ({
   subscribeFSEventsBatch: (callback: typeof events.emit) => {
@@ -143,8 +150,74 @@ describe('App live refresh and sorting integration', () => {
     });
   });
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('searches a checked drive, keeps its cached rows after eject and restart, and returns to the local query when unchecked', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    let online = true;
+    const localInvoke = mockedInvoke.getMockImplementation()!;
+    const diskPaths = ['/Volumes/Archive/big.txt', '/Volumes/Archive/small.txt'];
+    mockedInvoke.mockImplementation((command, payload) => {
+      if (command === 'list_volumes')
+        return Promise.resolve([
+          {
+            id: 'volume-a',
+            path: '/Volumes/Archive',
+            format: 'hfs',
+            reusable: true,
+            online,
+            indexing: false,
+            revision: online ? 1 : 2,
+            count: 2,
+            error: null,
+          },
+        ]);
+      if (command === 'query_volume') {
+        const request = (payload as { request: { sort?: { direction: string } } }).request;
+        const paths = request.sort?.direction === 'asc' ? [...diskPaths].reverse() : diskPaths;
+        return Promise.resolve({ total: 2, rows: paths.map((path) => ({ path })), highlights: [] });
+      }
+      return localInvoke(command, payload);
+    });
+    let app = render(<App />);
+    await tick(1600);
+    fireEvent.click(screen.getByRole('checkbox', { name: /Archive/ }));
+    await tick(120);
+    const externalRows = () =>
+      Array.from(app.container.querySelectorAll('.volume-files [data-row-path]'), (n) =>
+        n.getAttribute('data-row-path'),
+      );
+    expect(externalRows()).toEqual(diskPaths);
+    fireEvent.click(screen.getByRole('button', { name: 'columns.size' }));
+    await tick(50);
+    expect(externalRows()).toEqual([...diskPaths].reverse());
+    online = false;
+    act(() => mounts.changed());
+    await tick(70);
+    expect(screen.getByRole('checkbox', { name: /volumes.offline/ })).toBeChecked();
+    fireEvent.doubleClick(app.container.querySelector('.volume-files [data-row-path]')!);
+    expect(mockedInvoke.mock.calls.some(([cmd]) => cmd === 'open_volume_path')).toBe(false);
+    app.unmount();
+    app = render(<App />);
+    await tick(150);
+    expect(screen.getByRole('checkbox', { name: /volumes.offline/ })).toBeChecked();
+    expect(externalRows()).toEqual(diskPaths);
+    const input = screen.getByRole('textbox', { name: 'search.aria.searchInput' });
+    fireEvent.change(input, { target: { value: 'needle' } });
+    await tick(400);
+    expect(
+      mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'query_volume').pop()?.[1],
+    ).toMatchObject({ request: { query: 'needle' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /Archive/ }));
+    await tick(700);
+    expect(externalRows()).toEqual([]);
+    expect(visiblePaths(app.container)).toEqual(paths);
+    expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'search').pop()?.[1]).toMatchObject({
+      query: 'needle',
+    });
   });
 
   it('keeps the real list, scroll position, cached rows and selection through slow unrelated event bursts', async () => {

@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 mod darwin;
+#[cfg(target_os = "macos")]
+pub use darwin::catalog::walk_hfs_catalog;
 
 use rayon::{iter::ParallelBridge, prelude::*};
 use serde::{Deserialize, Serialize};

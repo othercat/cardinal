@@ -208,7 +208,7 @@ pub(crate) fn normalize_watch_config(
     {
         ignore_paths.push(DEFAULT_SYSTEM_IGNORE_PATH.to_string());
     }
-    let include_paths = include_paths
+    let mut include_paths = include_paths
         .into_iter()
         .filter_map(|path| {
             let normalized = normalize_path_input(&path);
@@ -218,6 +218,12 @@ pub(crate) fn normalize_watch_config(
             normalized
         })
         .collect::<Vec<_>>();
+    if watch_root == "/" {
+        if !ignore_paths.iter().any(|p| p == "/Volumes") {
+            ignore_paths.push("/Volumes".into());
+        }
+        include_paths.retain(|p| !Path::new(p).starts_with("/Volumes"));
+    }
     Some((watch_root, ignore_paths, include_paths))
 }
 
