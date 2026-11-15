@@ -4,10 +4,11 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use libc::dev_t;
 use objc2_core_foundation::{CFArray, CFString, CFTimeInterval};
 use objc2_core_services::{
-    ConstFSEventStreamRef, FSEventStreamContext, FSEventStreamCreate, FSEventStreamEventFlags,
-    FSEventStreamEventId, FSEventStreamGetDeviceBeingWatched, FSEventStreamInvalidate,
-    FSEventStreamRef, FSEventStreamRelease, FSEventStreamSetDispatchQueue, FSEventStreamStart,
-    FSEventStreamStop, kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
+    ConstFSEventStreamRef, FSEventStreamContext, FSEventStreamCreate,
+    FSEventStreamCreateRelativeToDevice, FSEventStreamEventFlags, FSEventStreamEventId,
+    FSEventStreamGetDeviceBeingWatched, FSEventStreamInvalidate, FSEventStreamRef,
+    FSEventStreamRelease, FSEventStreamSetDispatchQueue, FSEventStreamStart, FSEventStreamStop,
+    kFSEventStreamCreateFlagFileEvents, kFSEventStreamCreateFlagNoDefer,
     kFSEventStreamCreateFlagWatchRoot,
 };
 use std::{
@@ -42,6 +43,16 @@ impl EventStream {
         latency: CFTimeInterval,
         callback: EventsCallback,
     ) -> Self {
+        Self::create(paths, None, since_event_id, latency, callback).expect("create event stream")
+    }
+
+    fn create(
+        paths: &[&str],
+        device: Option<dev_t>,
+        since_event_id: u64,
+        latency: f64,
+        callback: EventsCallback,
+    ) -> Option<Self> {
         unsafe extern "C-unwind" fn drop_callback(info: *const c_void) {
             let _cb: Box<EventsCallback> = unsafe { Box::from_raw(info as _) };
         }
@@ -80,20 +91,74 @@ impl EventStream {
             copyDescription: None,
         };
 
-        let stream: FSEventStreamRef = unsafe {
-            FSEventStreamCreate(
-                None,
-                Some(raw_callback),
-                &mut context,
-                paths.as_opaque(),
-                since_event_id,
-                latency,
-                kFSEventStreamCreateFlagNoDefer
-                    | kFSEventStreamCreateFlagFileEvents
-                    | kFSEventStreamCreateFlagWatchRoot,
-            )
+        let flags = kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagFileEvents;
+        let stream = unsafe {
+            match device {
+                Some(dev) => FSEventStreamCreateRelativeToDevice(
+                    None,
+                    Some(raw_callback),
+                    &mut context,
+                    dev,
+                    paths.as_opaque(),
+                    since_event_id,
+                    latency,
+                    flags,
+                ),
+                None => FSEventStreamCreate(
+                    None,
+                    Some(raw_callback),
+                    &mut context,
+                    paths.as_opaque(),
+                    since_event_id,
+                    latency,
+                    flags | kFSEventStreamCreateFlagWatchRoot,
+                ),
+            }
         };
-        Self { stream }
+        if stream.is_null() {
+            unsafe { drop_callback(context.info) };
+            return None;
+        }
+        Some(Self { stream })
+    }
+
+    /// Absolute paths for this mount, IDs from this device's journal only.
+    pub fn watch_volume(
+        dev: dev_t,
+        mount: PathBuf,
+        since: u64,
+    ) -> Option<(Receiver<Vec<FsEvent>>, EventStreamWithQueue)> {
+        let (tx, rx) = unbounded();
+        let stream = Self::create(
+            &[""],
+            Some(dev),
+            since,
+            0.12,
+            Box::new(move |mut events| {
+                for event in &mut events {
+                    let relative = event.path.strip_prefix("/").unwrap_or(&event.path);
+                    event.path = mount.join(relative);
+                }
+                let _ = tx.send(events);
+            }),
+        )?
+        .spawn()?;
+        Some((rx, stream))
+    }
+
+    pub fn watch_live_path(path: &str) -> Option<(Receiver<Vec<FsEvent>>, EventStreamWithQueue)> {
+        let (tx, rx) = unbounded();
+        let stream = Self::create(
+            &[path],
+            None,
+            u64::MAX,
+            0.12,
+            Box::new(move |events| {
+                let _ = tx.send(events);
+            }),
+        )?
+        .spawn()?;
+        Some((rx, stream))
     }
 
     // Start the FSEventStream with a dispatch queue.
@@ -106,8 +171,10 @@ impl EventStream {
             unsafe { FSEventStreamInvalidate(self.stream) };
             return None;
         }
-        let stream = self.stream;
-        Some(EventStreamWithQueue { stream, queue })
+        Some(EventStreamWithQueue {
+            stream: self,
+            queue,
+        })
     }
 
     // Get device id being watched by this event stream.
@@ -120,7 +187,7 @@ impl EventStream {
 ///
 /// Dropping this struct will stop the FSEventStream and release the dispatch queue.
 pub struct EventStreamWithQueue {
-    stream: FSEventStreamRef,
+    stream: EventStream,
     #[allow(dead_code)]
     queue: DispatchRetained<DispatchQueue>,
 }
@@ -128,8 +195,8 @@ pub struct EventStreamWithQueue {
 impl Drop for EventStreamWithQueue {
     fn drop(&mut self) {
         unsafe {
-            FSEventStreamStop(self.stream);
-            FSEventStreamInvalidate(self.stream);
+            FSEventStreamStop(self.stream.stream);
+            FSEventStreamInvalidate(self.stream.stream);
         }
     }
 }
@@ -227,6 +294,36 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    #[test]
+    #[ignore = "requires a macOS volume with a persistent FSEvents journal"]
+    fn device_stream_replays_a_saved_cursor_and_follows_live_writes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let dev = dir.path().metadata().unwrap().dev() as dev_t;
+        let since = crate::last_event_id_before_time(dev, crate::current_timestamp());
+        assert_ne!(since, 0);
+        let first = format!("cardinal-journal-before-{}", std::process::id());
+        let next = format!("cardinal-journal-after-{}", std::process::id());
+        std::fs::write(dir.path().join(&first), b"history").unwrap();
+        let (rx, _stream) = EventStream::watch_volume(dev, "/".into(), since).unwrap();
+        let observe = |name: &str| {
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while let Ok(batch) = rx.recv_deadline(deadline) {
+                if let Some(event) = batch
+                    .iter()
+                    .find(|e| e.path.file_name() == Some(name.as_ref()))
+                {
+                    assert!(event.path.is_absolute());
+                    return event.id;
+                }
+            }
+            panic!("No matching device event for test fixture");
+        };
+        let saved = observe(&first);
+        std::fs::write(dir.path().join(&next), b"live").unwrap();
+        assert!(observe(&next) >= saved);
+    }
 
     #[test]
     fn noop_event_watcher_recv_timeout_never_disconnects() {

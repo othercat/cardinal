@@ -259,7 +259,7 @@ type UseFileSearchResult = {
   pendingSortRef: MutableRefObject<Promise<unknown> | null>;
 };
 
-export function useFileSearch(): UseFileSearchResult {
+export function useFileSearch(enabled = true): UseFileSearchResult {
   const [initialSearchParamsForHook] = useState<SearchParams>(() => ({
     ...initialSearchParams,
     directoryScopeOpen: readStoredDirectoryScopeOpen(),
@@ -338,6 +338,7 @@ export function useFileSearch(): UseFileSearchResult {
       background = false,
       fileChanges: FileChangeBatch = null,
     ) => {
+      if (!enabled) return;
       if (background) {
         // Finish the current sort before another live query can replace its
         // source. User input always takes priority over automatic work.
@@ -484,7 +485,7 @@ export function useFileSearch(): UseFileSearchResult {
         if (!background) hasInitialSearchRunRef.current = true;
       }
     },
-    [],
+    [enabled],
   );
 
   const queueSearchParams = useCallback(
@@ -530,8 +531,14 @@ export function useFileSearch(): UseFileSearchResult {
   useEffect(() => cancelPendingSearches, [cancelPendingSearches]);
 
   useEffect(() => {
+    if (!enabled) {
+      searchVersionRef.current++;
+      foregroundPendingRef.current = false;
+      hasInitialSearchRunRef.current = false;
+      return;
+    }
     if (!hasInitialSearchRunRef.current) {
-      void handleSearch({ query: '' });
+      void handleSearch();
       return;
     }
 
@@ -541,7 +548,7 @@ export function useFileSearch(): UseFileSearchResult {
     }
 
     void handleSearch();
-  }, [handleSearch, searchParams.caseSensitive]);
+  }, [enabled, handleSearch, searchParams.caseSensitive]);
 
   const requestRescan = useCallback(async () => {
     await invoke('trigger_rescan');
@@ -553,7 +560,7 @@ export function useFileSearch(): UseFileSearchResult {
   );
   useLiveSearchRefresh(
     refreshSearch,
-    state.lifecycleState === 'Ready' || state.viewId !== undefined,
+    enabled && (state.lifecycleState === 'Ready' || state.viewId !== undefined),
     state.incremental !== false,
     (state.lifecycleState === 'Ready'
       ? 'ready'

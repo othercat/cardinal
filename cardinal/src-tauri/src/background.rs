@@ -870,7 +870,7 @@ pub fn run_background_event_loop(
     }
 }
 
-fn view_page(
+pub(crate) fn view_page(
     ids: &[SlabIndex],
     missing: usize,
     desc: bool,

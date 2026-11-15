@@ -2,6 +2,8 @@
 //! syscall as the names. The ABI and packing rules come from <sys/attr.h> and
 //! getattrlistbulk(2); unsupported volumes fall back to std::fs::read_dir.
 
+pub(super) mod catalog;
+
 use super::{NodeFileType, NodeMetadata};
 use std::{
     cell::RefCell,
@@ -156,7 +158,7 @@ fn read_entries(
 }
 
 fn invalid_record() -> io::Error {
-    io::Error::new(ErrorKind::InvalidData, "invalid getattrlistbulk record")
+    io::Error::new(ErrorKind::InvalidData, "invalid Darwin attribute record")
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {

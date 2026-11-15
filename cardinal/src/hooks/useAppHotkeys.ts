@@ -15,7 +15,7 @@ type MoveSelectionOptions = {
 };
 
 type UseAppHotkeysOptions = {
-  activeTab: StatusTabKey;
+  activeTab: StatusTabKey | 'volume';
   activeRowIndex: number | null;
   selectedPaths: string[];
   selectedIndicesRef: MutableRefObject<number[]>;
@@ -47,7 +47,10 @@ export function useAppHotkeys({
   navigateSelection,
   triggerQuickLook,
 }: UseAppHotkeysOptions): void {
-  const keyboardStateRef = useRef<{ activeTab: StatusTabKey; activeRowIndex: number | null }>({
+  const keyboardStateRef = useRef<{
+    activeTab: UseAppHotkeysOptions['activeTab'];
+    activeRowIndex: number | null;
+  }>({
     activeTab,
     activeRowIndex,
   });
@@ -57,48 +60,50 @@ export function useAppHotkeys({
     keyboardStateRef.current.activeRowIndex = activeRowIndex;
   }, [activeTab, activeRowIndex]);
 
-  const handleMetaShortcut = useStableEvent((event: KeyboardEvent, currentTab: StatusTabKey) => {
-    const key = event.key.toLowerCase();
-    if (key === 'f') {
-      event.preventDefault();
-      focusAndSelectSearchInput();
-      return true;
-    }
+  const handleMetaShortcut = useStableEvent(
+    (event: KeyboardEvent, currentTab: UseAppHotkeysOptions['activeTab']) => {
+      const key = event.key.toLowerCase();
+      if (key === 'f') {
+        event.preventDefault();
+        focusAndSelectSearchInput();
+        return true;
+      }
 
-    // Preserve native copy/edit behavior when focus is inside an editable control.
-    // Meta+F is intentionally handled above to focus the app search input.
-    if (isEditableTarget(event.target)) {
+      // Preserve native copy/edit behavior when focus is inside an editable control.
+      // Meta+F is intentionally handled above to focus the app search input.
+      if (isEditableTarget(event.target)) {
+        return false;
+      }
+
+      if (currentTab !== 'files') {
+        return false;
+      }
+
+      if (key === 'r' && selectedPaths.length > 0) {
+        event.preventDefault();
+        selectedPaths.forEach((path) => {
+          void invoke('open_in_finder', { path });
+        });
+        return true;
+      }
+
+      if (key === 'o' && selectedPaths.length > 0) {
+        event.preventDefault();
+        selectedPaths.forEach((path) => openResultPath(path));
+        return true;
+      }
+
+      if (key === 'c' && selectedPaths.length > 0) {
+        event.preventDefault();
+        void invoke('copy_files_to_clipboard', { paths: selectedPaths }).catch((error) => {
+          console.error('Failed to copy files to clipboard', error);
+        });
+        return true;
+      }
+
       return false;
-    }
-
-    if (currentTab !== 'files') {
-      return false;
-    }
-
-    if (key === 'r' && selectedPaths.length > 0) {
-      event.preventDefault();
-      selectedPaths.forEach((path) => {
-        void invoke('open_in_finder', { path });
-      });
-      return true;
-    }
-
-    if (key === 'o' && selectedPaths.length > 0) {
-      event.preventDefault();
-      selectedPaths.forEach((path) => openResultPath(path));
-      return true;
-    }
-
-    if (key === 'c' && selectedPaths.length > 0) {
-      event.preventDefault();
-      void invoke('copy_files_to_clipboard', { paths: selectedPaths }).catch((error) => {
-        console.error('Failed to copy files to clipboard', error);
-      });
-      return true;
-    }
-
-    return false;
-  });
+    },
+  );
 
   const handleFilesNavigation = useStableEvent((event: KeyboardEvent) => {
     const target = event.target as HTMLElement | null;

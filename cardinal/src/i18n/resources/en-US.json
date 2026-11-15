@@ -1,4 +1,13 @@
 {
+  "volumes": {
+    "scope": "Search volume",
+    "local": "This Mac",
+    "online": "Connected",
+    "indexing": "Indexing",
+    "offline": "Offline cache",
+    "snapshot": "Separate snapshot",
+    "offlineHint": "Offline · Search names, paths, sizes and dates. Reconnect the volume to open a file."
+  },
   "search": {
     "placeholder": {
       "files": "Search for files and folders...",

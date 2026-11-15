@@ -474,6 +474,30 @@ button:active:not(:disabled) {
   display: none;
 }
 
+.volume-selector {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 2px var(--container-padding);
+  overflow-x: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.volume-selector label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.volume-message,
+.volume-selector > span {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
 .scroll-area {
   overflow: hidden; /* Hide the outer scrollbar while letting children scroll. */
   height: 100%;

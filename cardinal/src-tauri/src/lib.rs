@@ -8,6 +8,7 @@ mod persistence;
 mod quicklook;
 mod search_activity;
 mod sort;
+mod volumes;
 mod window_controls;
 
 use anyhow::Result;
@@ -117,6 +118,7 @@ pub fn run() -> Result<()> {
         });
 
     let app = builder
+        .manage(volumes::Volumes::default())
         .manage(SearchState::new(
             search_tx,
             node_info_tx,
@@ -127,6 +129,10 @@ pub fn run() -> Result<()> {
             update_window_state_tx.clone(),
         ))
         .invoke_handler(tauri::generate_handler![
+            volumes::list_volumes,
+            volumes::rescan_volume,
+            volumes::query::query_volume,
+            volumes::open_volume_path,
             search,
             get_nodes_info,
             get_view_page,
@@ -155,6 +161,9 @@ pub fn run() -> Result<()> {
         .expect("Failed to initialize database path");
 
     let app_handle = &app.handle().to_owned();
+    let external = app.state::<volumes::Volumes>().inner().clone();
+    let mount_wake = volumes::mount_notifications();
+    let volume_dir = db_path.with_file_name("volumes");
     let channels = BackgroundLoopChannels {
         finish_rx,
         search_rx,
@@ -187,17 +196,24 @@ pub fn run() -> Result<()> {
                 return;
             };
 
-            run_logic_thread(app_handle, db_path, channels, config);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    volumes::monitor(external, volume_dir, mount_wake, app_handle.clone())
+                });
+                run_logic_thread(app_handle, db_path, channels, config);
+            });
         });
 
         app.run(move |app_handle, event| match event {
             RunEvent::Exit => {
                 APP_QUIT.store(true, Ordering::Relaxed);
+                volumes::stop_monitor();
                 flush_cache_to_file_once(&finish_tx, db_path);
             }
             RunEvent::ExitRequested { api, code, .. } => {
                 let already_requested = EXIT_REQUESTED.swap(true, Ordering::Relaxed);
                 APP_QUIT.store(true, Ordering::Relaxed);
+                volumes::stop_monitor();
                 if !already_requested {
                     info!(
                         "Exit requested (code: {:?}); flushing cache before shutdown",

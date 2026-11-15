@@ -504,6 +504,11 @@ impl SearchCache {
                     .ok_or_else(|| anyhow!("dc: requires a date or range"))?;
                 self.evaluate_date_filter(DateField::Created, argument, base, token)
             }
+            FilterKind::Content | FilterKind::Tag if self.file_nodes.index_only() => {
+                bail!(
+                    "Volume caches contain file names and metadata only (content:/tag: unavailable)"
+                )
+            }
             FilterKind::Content => {
                 let argument = filter
                     .argument
@@ -1055,7 +1060,7 @@ impl SearchCache {
 
     pub(crate) fn ensure_metadata(&mut self, index: SlabIndex) -> SlabNodeMetadataCompact {
         let current = self.file_nodes[index].metadata;
-        if !current.is_none() {
+        if !current.is_none() || self.file_nodes.index_only() {
             return current;
         }
         let path = self

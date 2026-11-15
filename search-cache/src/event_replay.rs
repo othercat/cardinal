@@ -51,7 +51,7 @@ impl EventPlan {
         EventReplay { rx, cancelled }
     }
 
-    pub(super) fn read(self, cancelled: impl Fn() -> bool, mut emit: impl FnMut(EventObservation)) {
+    pub fn read(self, cancelled: impl Fn() -> bool, mut emit: impl FnMut(EventObservation)) {
         for (path, recursive) in self.paths {
             if cancelled() {
                 return;

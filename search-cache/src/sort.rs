@@ -335,7 +335,7 @@ impl SearchCache {
             let Some(node) = self.file_nodes.get(id) else {
                 continue;
             };
-            if id == root {
+            if id == root && !self.file_nodes.index_only() {
                 root_position = Some(rows.len());
             } else if previous != Some(node.name()) {
                 if root_rank.is_none() && node.name() >= "/" {
@@ -398,7 +398,7 @@ impl SearchCache {
     ) -> Option<SortSnapshot> {
         token.is_cancelled()?;
         let numeric_key = matches!(key, SortKey::Size | SortKey::Mtime | SortKey::Ctime);
-        if numeric_key {
+        if numeric_key && !self.file_nodes.index_only() {
             self.warm_sort_metadata(indices, token)?;
         }
         let mut entries = Vec::with_capacity(indices.len());
@@ -483,6 +483,13 @@ impl SearchCache {
                 Arc::from(path)
             });
             (node.name(), Arc::clone(directory))
+        } else if self.file_nodes.index_only() {
+            let parent = self
+                .file_nodes
+                .path()
+                .parent()
+                .unwrap_or(std::path::Path::new("/"));
+            (node.name(), Arc::from(format!("{}/", parent.display())))
         } else {
             ("/", Arc::from(""))
         };
@@ -656,6 +663,13 @@ impl Ord for MergeHead<'_> {
 }
 
 impl SortSnapshot {
+    pub fn missing_numeric(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|row| row.numeric == i64::MIN)
+            .count()
+    }
+
     /// Sort owned keys away from the index thread. Bound cancellation latency
     /// with sorted runs and a cancellable merge, never a stateful comparator.
     pub fn sort(

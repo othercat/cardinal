@@ -189,6 +189,50 @@ impl SearchCache {
         self.file_nodes.len()
     }
 
+    /// Removable-volume snapshots contain a single volume-relative tree. Its
+    /// location can change when another volume already has the same name.
+    pub fn from_volume_tree(
+        mount: &Path,
+        tree: &Node,
+        ignore: Vec<PathBuf>,
+        since: u64,
+        stop: &'static AtomicBool,
+    ) -> Self {
+        let mut slab = ThinSlab::new();
+        let mut names = NameIndex::default();
+        let root = construct_node_slab_name_index(None, tree, &mut slab, &mut names);
+        let mut nodes = FileNodes::new(mount.to_owned(), ignore, vec![], slab, root);
+        nodes.use_volume_root(mount);
+        Self::new(nodes, since, 0, names, stop)
+    }
+
+    pub fn restore_volume_root(&mut self, mount: &Path) {
+        self.file_nodes.use_volume_root(mount);
+        let id = self.file_nodes.root();
+        let node = &mut self.file_nodes[id];
+        if let Some(label) = mount.file_name().and_then(OsStr::to_str)
+            && label != node.name()
+        {
+            self.name_index.remove_index(node.name(), id);
+            let children = std::mem::take(&mut node.children);
+            *node = SlabNode::new(None, NAME_POOL.push(label), node.metadata);
+            node.children = children;
+            self.name_index.add_index(label, id, &self.file_nodes);
+        }
+    }
+
+    pub fn cached_file_nodes(&mut self, nodes: &[SlabIndex]) -> Vec<SearchResultNode> {
+        self.expand_file_nodes_inner::<false>(nodes)
+    }
+
+    /// Narrow a restored watch configuration after a subtree gets its own index.
+    pub fn exclude_subtree(&mut self, subtree: &Path, ignore: &[PathBuf], include: &[PathBuf]) {
+        if subtree != self.file_nodes.tree_root() {
+            self.remove_node_path(subtree);
+        }
+        self.file_nodes.set_paths(ignore, include);
+    }
+
     pub fn walk_fs_with_ignore(path: &Path, ignore_paths: &[PathBuf]) -> Self {
         Self::walk_fs_with_walk_data(
             &WalkData::new(path, ignore_paths, &[], false, || false),
@@ -580,7 +624,7 @@ impl SearchCache {
         path: &Path,
         case_insensitive: bool,
     ) -> Option<SlabIndex> {
-        let Ok(path) = path.strip_prefix("/") else {
+        let Ok(path) = path.strip_prefix(self.file_nodes.tree_root()) else {
             return None;
         };
         let mut current = self.file_nodes.root();
@@ -637,7 +681,7 @@ impl SearchCache {
 
     /// Removes a node by path and its children recursively.
     fn remove_node_path(&mut self, path: &Path) -> Option<SlabIndex> {
-        let Ok(path) = path.strip_prefix("/") else {
+        let Ok(path) = path.strip_prefix(self.file_nodes.tree_root()) else {
             return None;
         };
         let mut current = self.file_nodes.root();
@@ -658,11 +702,11 @@ impl SearchCache {
 
     // Create node chain of specific path
     fn create_node_chain(&mut self, path: &Path) -> SlabIndex {
+        let mut current_path = self.file_nodes.tree_root().to_owned();
         let path = path
-            .strip_prefix("/")
+            .strip_prefix(&current_path)
             .expect("create_node_chain only accepts absolute path");
         let mut current = self.file_nodes.root();
-        let mut current_path = PathBuf::from("/");
         for name in path {
             current_path.push(name);
             current = if let Some(&index) = self.file_nodes[current]

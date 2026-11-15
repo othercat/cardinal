@@ -21,6 +21,7 @@ type FileRowProps = {
   selectedPathsForDrag?: string[];
   caseInsensitive?: boolean;
   highlightTerms?: readonly string[];
+  allowDrag?: boolean;
 };
 
 export const FileRow = memo(function FileRow({
@@ -34,6 +35,7 @@ export const FileRow = memo(function FileRow({
   selectedPathsForDrag = [],
   caseInsensitive,
   highlightTerms,
+  allowDrag = true,
 }: FileRowProps): React.JSX.Element {
   const pendingSelectRef = useRef<{
     isShift: boolean;
@@ -143,8 +145,8 @@ export const FileRow = memo(function FileRow({
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}
       onDoubleClick={handleDoubleClick}
-      draggable={true}
-      onDragStart={handleDragStart}
+      draggable={allowDrag}
+      onDragStart={allowDrag ? handleDragStart : undefined}
       aria-selected={isSelected}
       title={path}
     >

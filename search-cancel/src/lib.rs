@@ -18,6 +18,16 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
+    /// Admit a client-numbered request in an independent cancellation domain.
+    /// Requests for pages of the same view share its version.
+    pub fn for_request(active_version: &'static AtomicU64, version: u64) -> Self {
+        active_version.fetch_max(version, Ordering::Relaxed);
+        Self {
+            active_version,
+            version,
+        }
+    }
+
     pub fn noop() -> Self {
         static NOOP: AtomicU64 = AtomicU64::new(0);
         Self {
