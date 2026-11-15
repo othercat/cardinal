@@ -23,7 +23,7 @@
   "columns": {
     "filename": "Nombre de archivo",
     "path": "Ruta",
-    "size": "Tamaño",
+    "size": "Tamaño en disco",
     "modified": "Modificado",
     "created": "Creado"
   },

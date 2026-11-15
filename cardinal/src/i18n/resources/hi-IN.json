@@ -23,7 +23,7 @@
   "columns": {
     "filename": "फ़ाइल नाम",
     "path": "पथ",
-    "size": "आकार",
+    "size": "डिस्क पर आकार",
     "modified": "संशोधित",
     "created": "निर्मित"
   },

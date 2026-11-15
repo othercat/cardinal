@@ -28,7 +28,10 @@ pub struct Node {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct NodeMetadata {
     pub r#type: NodeFileType,
+    /// Logical length of the data fork.
     pub size: u64,
+    /// Bytes of disk space allocated to the file, including its resource fork.
+    pub allocated_size: u64,
     pub ctime: Option<NonZeroU64>,
     pub mtime: Option<NonZeroU64>,
 }
@@ -115,6 +118,8 @@ impl NodeMetadata {
         Self {
             r#type,
             size,
+            // Darwin reports st_blocks in 512-byte units regardless of st_blksize.
+            allocated_size: metadata.blocks().saturating_mul(512),
             ctime,
             mtime,
         }

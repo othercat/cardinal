@@ -1,7 +1,7 @@
 import React, { memo, useCallback, DragEvent, useRef } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { MiddleEllipsisHighlight } from './MiddleEllipsisHighlight';
-import { formatKB, formatTimestamp } from '../utils/format';
+import { formatDiskUsage, formatTimestamp } from '../utils/format';
 import type { SearchResultItem } from '../types/search';
 import { startNativeFileDrag } from '../utils/drag';
 import { splitPath } from '../utils/path';
@@ -56,8 +56,7 @@ export const FileRow = memo(function FileRow({
   const metadata = item.metadata;
   const mtimeSec = metadata?.mtime ?? item.mtime;
   const ctimeSec = metadata?.ctime ?? item.ctime;
-  const sizeBytes = metadata?.size ?? item.size;
-  const sizeText = metadata?.type !== 1 ? formatKB(sizeBytes) : null;
+  const sizeText = metadata?.type !== 1 ? formatDiskUsage(metadata?.allocatedSize) : null;
   const mtimeText = formatTimestamp(mtimeSec);
   const ctimeText = formatTimestamp(ctimeSec);
 

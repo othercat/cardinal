@@ -97,10 +97,10 @@ impl NameAndParent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SlabNode {
+pub struct SlabNode<M = SlabNodeMetadataCompact> {
     name_and_parent: NameAndParent,
     pub children: ThinVec<SlabIndex>,
-    pub metadata: SlabNodeMetadataCompact,
+    pub metadata: M,
 }
 
 impl SlabNode {
@@ -151,6 +151,11 @@ impl<'a> SlabNodeMetadata<'a> {
         self.0.state_type_and_size.size()
     }
 
+    pub fn allocated_size(&self) -> Option<i64> {
+        (self.r#type() != NodeFileType::Dir && self.0.allocated_size >= 0)
+            .then_some(self.0.allocated_size)
+    }
+
     pub fn ctime(&self) -> Option<NonZeroU32> {
         NonZeroU32::new(self.0.ctime)
     }
@@ -160,19 +165,47 @@ impl<'a> SlabNodeMetadata<'a> {
     }
 }
 
-/// Use a compact form so that
+// The old wire format ended after the timestamps. Decode directly into the new slab
+// without re-enumerating the filesystem or allocating a second copy of the tree.
+#[derive(Deserialize)]
+pub(crate) struct LegacyNodeMetadata {
+    state_type_and_size: StateTypeSize,
+    ctime: u32,
+    mtime: u32,
+}
+
+impl From<SlabNode<LegacyNodeMetadata>> for SlabNode {
+    fn from(node: SlabNode<LegacyNodeMetadata>) -> Self {
+        Self {
+            name_and_parent: node.name_and_parent,
+            children: node.children,
+            metadata: SlabNodeMetadataCompact {
+                state_type_and_size: node.metadata.state_type_and_size,
+                ctime: node.metadata.ctime,
+                mtime: node.metadata.mtime,
+                allocated_size: ALLOCATION_PENDING,
+            },
+        }
+    }
+}
+
+const ALLOCATION_PENDING: i64 = -1;
+const ALLOCATION_UNREADABLE: i64 = -2;
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct SlabNodeMetadataCompact {
     state_type_and_size: StateTypeSize,
     // Actually a Option<NonZeroU32>, but using u32 here due to https://github.com/serde-rs/serde/issues/1834
     ctime: u32,
     mtime: u32,
+    allocated_size: i64,
 }
 
 impl SlabNodeMetadataCompact {
     pub fn unaccessible() -> Self {
         Self {
             state_type_and_size: StateTypeSize::unaccessible(),
+            allocated_size: ALLOCATION_UNREADABLE,
             ctime: 0,
             mtime: 0,
         }
@@ -182,12 +215,14 @@ impl SlabNodeMetadataCompact {
         fswalk::NodeMetadata {
             r#type,
             size,
+            allocated_size,
             ctime,
             mtime,
         }: fswalk::NodeMetadata,
     ) -> Self {
         Self {
             state_type_and_size: StateTypeSize::some(r#type, size),
+            allocated_size: allocated_size.min(i64::MAX as u64) as i64,
             ctime: ctime
                 .and_then(|x| std::num::NonZeroU32::try_from(x).ok())
                 .map(|x| x.get())
@@ -202,6 +237,7 @@ impl SlabNodeMetadataCompact {
     pub fn none() -> Self {
         Self {
             state_type_and_size: StateTypeSize::none(),
+            allocated_size: ALLOCATION_PENDING,
             ctime: 0,
             mtime: 0,
         }
@@ -228,6 +264,30 @@ impl SlabNodeMetadataCompact {
 
     pub fn is_unaccessible(&self) -> bool {
         matches!(self.state(), State::Unaccessible)
+    }
+
+    pub(crate) fn needs_hydration(&self, disk_usage: bool) -> bool {
+        self.is_none()
+            || (disk_usage
+                && self.is_some()
+                && self.file_type_hint() != NodeFileType::Dir
+                && self.allocated_size == ALLOCATION_PENDING)
+    }
+
+    pub(crate) fn hydrate_path(&mut self, path: &std::path::Path) {
+        let metadata = std::fs::symlink_metadata(path)
+            .map(|data| Self::some(data.into()))
+            .unwrap_or_else(|_| Self::unaccessible());
+        self.apply_hydration(metadata);
+    }
+
+    /// A failed allocation lookup must preserve the dates and logical size of a legacy row.
+    pub(crate) fn apply_hydration(&mut self, metadata: Self) {
+        if self.is_some() && metadata.is_unaccessible() {
+            self.allocated_size = ALLOCATION_UNREADABLE;
+        } else {
+            *self = metadata;
+        }
     }
 
     pub fn file_type_hint(&self) -> NodeFileType {

@@ -578,6 +578,7 @@ mod buffer_tests {
                 metadata: Some(NodeMetadata {
                     r#type: NodeFileType::File,
                     size: 1,
+                    allocated_size: 4096,
                     ctime: None,
                     mtime: None,
                 }),

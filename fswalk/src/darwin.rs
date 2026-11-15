@@ -25,6 +25,7 @@ const MODTIME: u32 = 0x0000_0400;
 const FLAGS: u32 = 0x0004_0000;
 const ERROR: u32 = 0x2000_0000;
 const RETURNED: u32 = 0x8000_0000;
+const ALLOCSIZE: u32 = 0x0000_0004;
 const DATALENGTH: u32 = 0x0000_0200;
 const MOUNTSTATUS: u32 = 0x0000_0004;
 const PACK_INVALID: u64 = 0x0000_0008;
@@ -80,7 +81,7 @@ pub(super) fn read_directory(
         commonattr: NAME | OBJTYPE | ERROR | RETURNED,
         volattr: 0,
         dirattr: if metadata { MOUNTSTATUS } else { 0 },
-        fileattr: if metadata { DATALENGTH } else { 0 },
+        fileattr: if metadata { ALLOCSIZE | DATALENGTH } else { 0 },
         forkattr: 0,
     };
     if metadata {
@@ -208,11 +209,11 @@ fn parse_record(record: &[u8], metadata: bool) -> io::Result<Entry> {
     let metadata = if metadata {
         let flags = u32_at(record, 72)?;
         // Directory/file groups are type-specific even with PACK_INVALID:
-        // directories contain MOUNTSTATUS here; other vnodes contain DATALENGTH.
-        let (mount, size) = if kind == NodeFileType::Dir {
-            (u32_at(record, 76)?, 0)
+        // directories contain MOUNTSTATUS; other vnodes contain ALLOCSIZE then DATALENGTH.
+        let (mount, allocated_size, size) = if kind == NodeFileType::Dir {
+            (u32_at(record, 76)?, 0, 0)
         } else {
-            (0, i64_at(record, 76)?)
+            (0, i64_at(record, 76)?, i64_at(record, 84)?)
         };
         let complete = common & (CRTIME | MODTIME | FLAGS) == CRTIME | MODTIME | FLAGS;
         // Mount/firmlink attributes describe the underlying node, not the
@@ -221,7 +222,11 @@ fn parse_record(record: &[u8], metadata: bool) -> io::Result<Entry> {
         // supplies the same size/timestamps as lstat for regular files and links.
         let usable = complete
             && match kind {
-                NodeFileType::File | NodeFileType::Symlink => file & DATALENGTH != 0 && size >= 0,
+                NodeFileType::File | NodeFileType::Symlink => {
+                    file & (ALLOCSIZE | DATALENGTH) == ALLOCSIZE | DATALENGTH
+                        && size >= 0
+                        && allocated_size >= 0
+                }
                 NodeFileType::Dir => {
                     dir & MOUNTSTATUS != 0 && mount & 1 == 0 && flags & SF_FIRMLINK == 0
                 }
@@ -229,11 +234,8 @@ fn parse_record(record: &[u8], metadata: bool) -> io::Result<Entry> {
             };
         usable.then(|| NodeMetadata {
             r#type: kind,
-            size: if kind != NodeFileType::Dir {
-                size as u64
-            } else {
-                0
-            },
+            size: size as u64,
+            allocated_size: allocated_size as u64,
             ctime: timestamp(record, 40).unwrap_or(None),
             mtime: timestamp(record, 56).unwrap_or(None),
         })
@@ -271,6 +273,7 @@ mod tests {
             NodeMetadata::from(std::fs::symlink_metadata(path.join(&file.name)).unwrap());
         assert_eq!(actual.r#type, expected.r#type);
         assert_eq!(actual.size, expected.size);
+        assert_eq!(actual.allocated_size, expected.allocated_size);
         assert_eq!(actual.ctime, expected.ctime);
         assert_eq!(actual.mtime, expected.mtime);
         let directory = entries
@@ -283,9 +286,44 @@ mod tests {
         let link_meta = link.metadata.unwrap();
         let expected = NodeMetadata::from(std::fs::symlink_metadata(path.join("link")).unwrap());
         assert_eq!(link_meta.size, expected.size);
+        assert_eq!(link_meta.allocated_size, expected.allocated_size);
         assert_eq!(link_meta.ctime, expected.ctime);
         assert_eq!(link_meta.mtime, expected.mtime);
         assert!(read_directory(&path.join("link"), true, || false).is_err());
+    }
+
+    #[test]
+    fn bulk_measures_allocated_blocks_for_sparse_empty_and_forked_files() {
+        use std::{fs, os::unix::fs::MetadataExt};
+
+        let temp = tempdir::TempDir::new("bulk_allocated").unwrap();
+        let root = temp.path();
+        let sparse = fs::File::create(root.join("sparse")).unwrap();
+        sparse.set_len(64 * 1024 * 1024).unwrap();
+        fs::File::create(root.join("empty")).unwrap();
+        let with_fork = root.join("forked");
+        fs::write(&with_fork, b"data").unwrap();
+        fs::write(with_fork.join("..namedfork/rsrc"), [0x5a; 16_384]).unwrap();
+        let entries = read_directory(root, true, || false).unwrap().unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            let actual = entry.metadata.expect("APFS bulk file attributes");
+            let stat = fs::symlink_metadata(root.join(&entry.name)).unwrap();
+            assert_eq!(
+                actual.allocated_size,
+                stat.blocks() * 512,
+                "{:?}",
+                entry.name
+            );
+            assert_eq!(actual.size, stat.size());
+            if entry.name == "sparse" {
+                assert!(actual.allocated_size < actual.size);
+            } else if entry.name == "empty" {
+                assert_eq!(actual.allocated_size, 0);
+            } else {
+                assert!(actual.allocated_size >= 16_384);
+            }
+        }
     }
 
     #[test]
@@ -325,6 +363,22 @@ mod tests {
         assert!(parse_record(&bytes, false).is_err());
         bytes[28..32].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(parse_record(&bytes, false).is_err());
+    }
+
+    #[test]
+    fn absent_allocsize_requests_a_stat_but_zero_allocation_is_valid() {
+        let mut bytes = [0u8; 96];
+        bytes[4..8].copy_from_slice(&(NAME | OBJTYPE | CRTIME | MODTIME | FLAGS).to_ne_bytes());
+        bytes[16..20].copy_from_slice(&DATALENGTH.to_ne_bytes());
+        bytes[28..32].copy_from_slice(&64u32.to_ne_bytes());
+        bytes[32..36].copy_from_slice(&4u32.to_ne_bytes());
+        bytes[36..40].copy_from_slice(&1u32.to_ne_bytes());
+        bytes[84..92].copy_from_slice(&8_000_000i64.to_ne_bytes());
+        bytes[92..96].copy_from_slice(b"raw\0");
+        assert!(parse_record(&bytes, true).unwrap().metadata.is_none());
+        bytes[16..20].copy_from_slice(&(ALLOCSIZE | DATALENGTH).to_ne_bytes());
+        let meta = parse_record(&bytes, true).unwrap().metadata.unwrap();
+        assert_eq!((meta.size, meta.allocated_size), (8_000_000, 0));
     }
 
     #[test]

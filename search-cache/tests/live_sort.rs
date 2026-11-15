@@ -3,6 +3,7 @@ use search_cache::{SearchCache, SearchOptions, SlabIndex, SortDirection, SortKey
 use search_cancel::CancellationToken;
 use std::{
     fs,
+    io::Write,
     time::{Duration, Instant},
 };
 
@@ -78,8 +79,8 @@ fn real_fsevents_create_modify_rename_delete_update_sorted_results() {
     let a = files.join("cardinal-live-a");
     let b = files.join("cardinal-live-b");
     let c = files.join("cardinal-live-c");
-    fs::write(&a, b"aa").unwrap();
-    fs::write(&b, b"bbbb").unwrap();
+    fs::File::create(&a).unwrap().set_len(1 << 40).unwrap();
+    fs::write(&b, vec![b'b'; 64 * 1024]).unwrap();
     wait_for(&mut cache, &watcher, |cache| results(cache).len() == 2);
     let ids = results(&mut cache);
     let sorted = cache
@@ -89,7 +90,14 @@ fn real_fsevents_create_modify_rename_delete_update_sorted_results() {
         .unwrap();
     assert_eq!(cache.node_path(sorted[0]).unwrap(), a);
 
-    fs::write(&a, b"aaaaaaaa").unwrap();
+    // Allocate blocks within the hole. The logical length and node ID stay fixed.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .write_all(&vec![b'a'; 128 * 1024])
+        .unwrap();
+    assert_eq!(fs::metadata(&a).unwrap().len(), 1 << 40);
     wait_for(&mut cache, &watcher, |cache| {
         let sorted = cache
             .prepare_sort(&ids, SortKey::Size, CancellationToken::noop())

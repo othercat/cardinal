@@ -24,11 +24,11 @@ where
     }
 }
 
-struct SlabVisitor<T>(PhantomData<T>);
+struct SlabVisitor<T, Wire = T>(PhantomData<(T, Wire)>);
 
-impl<'de, T> Visitor<'de> for SlabVisitor<T>
+impl<'de, T, Wire> Visitor<'de> for SlabVisitor<T, Wire>
 where
-    T: Deserialize<'de>,
+    Wire: Deserialize<'de> + Into<T>,
 {
     type Value = Slab<T>;
 
@@ -44,11 +44,22 @@ where
         let size = NonZeroUsize::new(size).unwrap_or(INITIAL_SLOTS);
         let mut builder = Builder::with_capacity(size).map_err(A::Error::custom)?;
 
-        while let Some((key, value)) = map.next_entry()? {
-            builder.pair(key, value).map_err(A::Error::custom)?
+        while let Some((key, value)) = map.next_entry::<usize, Wire>()? {
+            builder.pair(key, value.into()).map_err(A::Error::custom)?
         }
 
         Ok(builder.build())
+    }
+}
+
+impl<T> Slab<T> {
+    /// Upgrade each stored value directly into its original slot, including sparse slabs.
+    pub fn deserialize_from<'de, Wire, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        Wire: Deserialize<'de> + Into<T>,
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SlabVisitor::<T, Wire>(PhantomData))
     }
 }
 
@@ -60,7 +71,7 @@ where
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(SlabVisitor(PhantomData))
+        Self::deserialize_from::<T, _>(deserializer)
     }
 }
 

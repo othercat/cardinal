@@ -5,6 +5,20 @@ export function formatKB(bytes: number | null | undefined): string | null {
   return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
 }
 
+const diskUnits = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+const diskNumber = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+
+// Finder uses decimal storage units. A fully sparse file can legitimately use zero bytes.
+export function formatDiskUsage(bytes: number | null | undefined): string | null {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return null;
+  let unit = 0;
+  while (bytes >= 1000 && unit < diskUnits.length - 1) {
+    bytes /= 1000;
+    unit++;
+  }
+  return `${diskNumber.format(bytes)} ${diskUnits[unit]}`;
+}
+
 // Format timestamp (in seconds) as YYYY-MM-DD HH:mm:ss
 export function formatTimestamp(timestampSec: number | null | undefined): string | null {
   if (timestampSec == null || !Number.isFinite(timestampSec)) return null;

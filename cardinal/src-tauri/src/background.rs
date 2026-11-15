@@ -829,7 +829,7 @@ pub fn run_background_event_loop(
                         );
                         hydration = Some(Hydration {
                             cancel: Arc::new(AtomicBool::new(false)),
-                            pending: Some(search_cache::MetadataPlanner::new(ids)),
+                            pending: Some(search_cache::MetadataPlanner::for_sort(ids, sort.key)),
                             progress,
                             emitted: Instant::now(),
                             published: Instant::now(),

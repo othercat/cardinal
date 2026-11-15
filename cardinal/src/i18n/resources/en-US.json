@@ -32,7 +32,7 @@
   "columns": {
     "filename": "Filename",
     "path": "Path",
-    "size": "Size",
+    "size": "Size on disk",
     "modified": "Modified",
     "created": "Created"
   },

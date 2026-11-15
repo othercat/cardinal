@@ -23,7 +23,7 @@
   "columns": {
     "filename": "Dateiname",
     "path": "Pfad",
-    "size": "Größe",
+    "size": "Größe auf Datenträger",
     "modified": "Geändert",
     "created": "Erstellt"
   },

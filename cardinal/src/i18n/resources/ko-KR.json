@@ -23,7 +23,7 @@
   "columns": {
     "filename": "파일 이름",
     "path": "경로",
-    "size": "크기",
+    "size": "디스크 할당 크기",
     "modified": "수정됨",
     "created": "생성됨"
   },

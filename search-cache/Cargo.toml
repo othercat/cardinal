@@ -28,6 +28,7 @@ regex = "1"
 jiff = "0.2"
 rayon = "1.9"
 slab-mmap = { path = "../slab-mmap" }
+tempfile = "3"
 file-tags = { path = "../file-tags" }
 unicode-normalization = "0.1"
 

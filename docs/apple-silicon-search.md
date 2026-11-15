@@ -8,7 +8,15 @@
 
 将应用复制到另一台 M 系列 Mac（例如 M4 Mac mini，macOS 15+）即可使用；目标机首次仍需授予 macOS 文件访问权限。当前使用 ad-hoc 本地签名，没有 Developer ID notarization；跨机首次启动可能需要在系统设置中确认允许打开。分发前核对 Mach-O 架构、最低系统版本、签名、动态库和包内资源，确认没有个人目录或 Homebrew 依赖。
 
-当前版本为 `Cardinal Local 0.1.29`，分发包为 `delivery-root/releases/cardinal-release-r7-20261115.zip`。退出旧 Local 后替换同名应用即可继续使用原来的本机和移动卷索引。
+当前版本为 `Cardinal Local 0.1.30`，分发包为 `delivery-root/releases/cardinal-release-r8-20261115.zip`。退出旧 Local 后替换同名应用即可继续使用已有索引。
+
+## r8 的磁盘占用与旧索引升级
+
+「文件」中的「磁盘占用」列按文件系统分配的字节数显示、升降序排序和分页，采用十进制 KB、MB、GB 和 TB。在稀疏磁盘映像上，逻辑长度可以远大于磁盘占用。完全由空洞组成的文件可以显示 0 B，尚未取得占用数值的文件显示「—」。`size:` 查询和小文件事件合并继续使用逻辑长度。[Docker Desktop 磁盘映像说明](https://docs.docker.com/desktop/troubleshoot-and-support/faqs/macfaqs/)
+
+格式 5、6 的本机索引可直接载入，保留文件名、节点、已有日期和事件游标。查看少量结果时优先补读这些文件的属性。第一次对大结果集按磁盘占用排序，会在后台分批补齐。格式 7 会保存已取得的占用和进度，正常退出再打开可以接着使用。旧移动卷的缓存仍然可搜索，重新接入对应卷后可取得占用，后续离线也可排序。
+
+升级首次覆盖旧快照时会在同一目录留存 `<原文件名>.v5.bak` 或 `<原文件名>.v6.bak`。如果需要退回 r7，先退出 Cardinal，将格式 7 的快照移开，再把备份恢复为原文件名。本机主快照名为 `cardinal.db`，移动卷快照位于同目录的 `volumes/` 下。
 
 ## r7 的右键排除路径
 

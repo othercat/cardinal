@@ -23,7 +23,7 @@
   "columns": {
     "filename": "Dosya adı",
     "path": "Yol",
-    "size": "Boyut",
+    "size": "Diskteki boyut",
     "modified": "Değiştirildi",
     "created": "Oluşturuldu"
   },

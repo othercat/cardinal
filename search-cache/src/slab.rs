@@ -64,6 +64,14 @@ impl<T> Default for ThinSlab<T> {
 }
 
 impl<T> ThinSlab<T> {
+    pub(crate) fn deserialize_from<'de, Wire, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        Wire: Deserialize<'de> + Into<T>,
+        D: serde::Deserializer<'de>,
+    {
+        Slab::deserialize_from::<Wire, _>(deserializer).map(Self)
+    }
+
     /// Construct a ThinSlab, panicking if the mmap initialization fails.
     pub fn new() -> Self {
         Self::try_new().expect("ThinSlab::new failed to initialize memory-mapped slab")
