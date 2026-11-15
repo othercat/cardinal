@@ -4,7 +4,7 @@
 
 「大小」列显示文件系统报告的磁盘分配量，并用同一数值升降序排列。稀疏文件以 Docker 的磁盘映像为回归样本。本机和移动卷共用此规则，已有索引需保留名字、路径、时间、事件游标，并能在取得分配量后保存。既有 `size:` 搜索语法和小文件事件策略沿用逻辑长度。[总管 #1](issue-01-overall-management.md)
 
-基线为当前 r7 工作区，`master` 的 HEAD 为 `25a53416cdffa57c5b6205f78af33482df5b58b1`。验收覆盖逻辑长度与分配量顺序相反的文件、真实零占用、旧快照、离线卷、重启与用户提供的 `Docker.raw`。
+开发时沿用 r7 工作区，当时 `master` 的 HEAD 为 `25a53416cdffa57c5b6205f78af33482df5b58b1`。验收覆盖逻辑长度与分配量顺序相反的文件、真实零占用、旧快照、离线卷、重启与用户提供的 `Docker.raw`。
 
 ## r8 实现与升级
 
@@ -37,3 +37,5 @@ Apple M1 Pro，macOS 15.7.7。仅读取用户指定的 Docker 磁盘映像属性
 发行包 `delivery-root/releases/cardinal-release-r8-20261115.zip`，版本 0.1.30，SHA-256 为 `5b0fe3809e58f07485fc1bedeeca1fe5df9578cef977b0c3e1ca10895ba60aea`。逐项复核 299 个源码与配置输入、ZIP 内 7 个文件、解包签名、arm64、最低 macOS 15.0 和系统动态库。实测与校验记录位于本机 `delivery-root/artifacts/cardinal-issue-6/r8-validation/`。Issue 保持开放，等待日常使用反馈。
 
 推送前复核发现初版 ZIP 的清单含有它自身的过期摘要，已移除这一个条目。新清单逐项覆盖其余 6 个文件，已安装 r8 的 4 个应用文件与包内对应文件逐字节一致。原 ZIP 的 SHA-256 为 `9c3716847d495b2cd4601358eb9ef4ff66cbccd39281064eddac1a521587c0e4`。
+
+r8 已合入 `origin/master`。合并树与实现树一致，远端的 299 个构建输入逐项匹配 r8 发行清单。确认两次合并均可从远端到达后，已删除本地临时分支、打包暂存和解包副本。本机发行目录仅保留修正清单后的 r8 ZIP 与校验文件。[实现提交](https://github.com/othercat/cardinal/commit/78571f2ffc4abbcab4051c7576cdeeb7c377714a) · [合并提交](https://github.com/othercat/cardinal/commit/894b75e78893944c1bae0f7d69b462ed1ea01f8d)

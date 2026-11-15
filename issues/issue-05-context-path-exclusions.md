@@ -23,4 +23,6 @@ M1 Pro、macOS 15.7.7。本次根 Rust workspace 1,825 项通过，Tauri 默认 
 
 ## 本机交付
 
-发行包为 `delivery-root/releases/cardinal-release-r7-20261115.zip`（0.1.29），SHA-256 为 `0a7c1797cb749b67f56b74adf261cb9a48e30872c2efb942df194628bc9ae3f4`。逐项核对 299 个构建输入、解包文件、arm64、最低 macOS 15.0、系统动态库和 ad-hoc 签名。实测原始数据与发行校验归档到本机 `delivery-root/artifacts/cardinal-issue-5/r7-validation/`。源码保存在当前工作区。Issue 保持开放，等待日常使用验收。
+r7（0.1.29）发布时的 ZIP SHA-256 为 `0a7c1797cb749b67f56b74adf261cb9a48e30872c2efb942df194628bc9ae3f4`。发布时已核对解包文件、arm64、最低 macOS 15.0、系统动态库和 ad-hoc 签名。实测原始数据与发行校验归档在本机 `delivery-root/artifacts/cardinal-issue-5/r7-validation/`。
+
+r7 已合入 `origin/master`，其 299 个构建输入逐项匹配 r7 发行清单。确认远端包含完整提交后，已删除本地临时分支和源码还原副本。右键排除现随 r8 交付，Issue 保持开放，等待日常使用验收。[实现提交](https://github.com/othercat/cardinal/commit/c9eee10b4a5698e8c80f056895746cc75e8bf963) · [合并提交](https://github.com/othercat/cardinal/commit/56a40a8cd475b4fd87ab7e43d5b0aabbda42333a)
