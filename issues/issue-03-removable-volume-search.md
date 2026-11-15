@@ -23,3 +23,7 @@ r5（0.1.27）已在本机打包，映像验收通过。Issue 保持开放，等
 本机留存原始测量、窗口回执、构建输入和解包校验，目录为 `delivery-root/artifacts/cardinal-issue-3/r5-validation/`。复核 HFS+ 目录与现有遍历的命令、样本和口径见其中的 `hfs-probe/README.md`。磁盘映像插拔测试入口为 `volumes::tests::mounted_disk_images_search_updates_and_offline_restart`，需将 `CARDINAL_VOLUME_TEST_DIR` 指向独立测试目录，并使用 `--ignored`。
 
 实体 USB 或雷电硬盘尚待验证，重点是首次接入至结果可查的总时间、跨机写入后的同步，以及大规模离线搜索与排序。尚无数 TB 物理介质的用时数据。
+
+## 源码归档
+
+r5 已合入 `origin/master`。合并树与实现树一致，296 项构建输入逐项匹配 r5 发行清单。确认实现提交可从远端 `master` 到达后，已删除本地临时分支。当前安装包 r6 包含此功能。[实现提交](https://github.com/othercat/cardinal/commit/3d6b168463d708f46e34764b0e16f1fe666d8a35) · [合并提交](https://github.com/othercat/cardinal/commit/aee4ccad7fd1fb77805ea790b3f5f6d120db0cef)

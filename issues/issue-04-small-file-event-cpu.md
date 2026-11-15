@@ -35,3 +35,9 @@ r6（0.1.28）在已交付的 r5 工作区上实现，原构建基线为 `0460a4
 用同一文件往返跨过大小边界时，704 → 4,096 字节在 1,082 ms 显示，随后 4,096 → 8,192 字节为 62 ms，8,192 → 4,095 字节为 59 ms，再次写小到 1,536 字节为 1,070 ms。这一行为只依赖上次已确认的大小。
 
 详细进程拆分、重复样本、原始时间和复跑命令见本机 `delivery-root/artifacts/cardinal-issue-4/r6-validation/bench/CPU与延迟实测.md`。日常全盘平均占用、大容量实体卷及其他 Mac 的表现待实机验收，Issue 继续开放。
+
+## 源码与发行包复核
+
+r6 已合入 `origin/master`。合并树与实现树一致，297 项构建输入逐项匹配已测发行清单。确认远端包含完整实现后，已删除本地临时分支。[实现提交](https://github.com/othercat/cardinal/commit/aedce2a5ca75321bba0f08ad9f52a58e7092027a) · [合并提交](https://github.com/othercat/cardinal/commit/83c1a4cebf57683e19f47702c9c7a45d5243790e)
+
+清理时重新校验了 r6 ZIP 的 SHA-256、7 个文件的 CRC、包内清单及主程序执行权限。4 个应用文件与已安装的 r6 逐字节相同，已安装应用的签名校验通过。当前发行目录只保留 ZIP 和校验文件。
