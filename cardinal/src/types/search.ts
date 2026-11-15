@@ -1,6 +1,7 @@
 export type SearchResultMetadata = Readonly<{
   type: number;
   size: number;
+  allocatedSize?: number | null;
   mtime: number;
   ctime: number;
 }>;

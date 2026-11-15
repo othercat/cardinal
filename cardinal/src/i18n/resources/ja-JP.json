@@ -23,7 +23,7 @@
   "columns": {
     "filename": "ファイル名",
     "path": "パス",
-    "size": "サイズ",
+    "size": "ディスク上のサイズ",
     "modified": "更新日時",
     "created": "作成日時"
   },

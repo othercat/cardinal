@@ -258,9 +258,11 @@ pub struct SortedEdits {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeInfoMetadata {
     pub r#type: u8,
     pub size: i64,
+    pub allocated_size: Option<i64>,
     pub ctime: u32,
     pub mtime: u32,
 }
@@ -270,6 +272,7 @@ impl NodeInfoMetadata {
         Self {
             r#type: metadata.r#type() as u8,
             size: metadata.size(),
+            allocated_size: metadata.allocated_size(),
             ctime: metadata.ctime().map(|x| x.get()).unwrap_or_default(),
             mtime: metadata.mtime().map(|x| x.get()).unwrap_or_default(),
         }

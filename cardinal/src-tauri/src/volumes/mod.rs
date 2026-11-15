@@ -394,6 +394,14 @@ fn checkpoint(source: &Volume, index: &mut Index, db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Cursor for device-journal replay and whether the saved mount point changed.
+fn journal_resume(db: &Path, mount: &Path, cursor: u64) -> Option<(u64, bool)> {
+    // v5/v6 recorded only logical lengths. Keep them searchable while the
+    // mounted volume supplies allocations, even if its journal has no changes.
+    let header = read_snapshot_header(db).ok()?;
+    (header.source_version == search_cache::LSF_VERSION).then_some((cursor, header.path != mount))
+}
+
 fn run_mount(
     source: &Volume,
     mount: &Mount,
@@ -455,7 +463,7 @@ fn watch(
         mount.journal.as_deref().unwrap_or("none")
     ));
     let tip = last_event_id_before_time(mount.dev, current_timestamp());
-    let saved = {
+    let cursor = {
         let mut data = source.index.lock();
         // A damaged volume snapshot can still be replaced by a complete new scan.
         if let Err(e) = source.load_snapshot(&mut data) {
@@ -473,7 +481,7 @@ fn watch(
         }
         // Foreign FAT/NTFS writers need not update Apple's journal. Offer the
         // cache immediately and reconcile their directory tree on attachment.
-        data.as_mut()
+        data.as_ref()
             .filter(|i| i.cache.ignore_paths().as_ref() == exclusions(mount))
             .map(|i| i.cache.last_event_id())
             .filter(|&cursor| {
@@ -486,8 +494,13 @@ fn watch(
             })
     };
     notify();
+    let saved = cursor.and_then(|cursor| journal_resume(&db, &mount.path, cursor));
     let device_stream = mount.journal.as_ref().and_then(|_| {
-        EventStream::watch_volume(mount.dev, mount.path.clone(), saved.unwrap_or(u64::MAX))
+        EventStream::watch_volume(
+            mount.dev,
+            mount.path.clone(),
+            saved.map_or(u64::MAX, |(cursor, _)| cursor),
+        )
     });
     // A drive without a persistent device stream can still be searched and watched live.
     let live_only = device_stream.is_none();
@@ -500,7 +513,8 @@ fn watch(
     } else {
         db
     };
-    let mut dirty = false;
+    // Persist a renamed mount point even with no new file events.
+    let mut dirty = !live_only && saved.is_some_and(|(_, renamed)| renamed);
     if saved.is_none() || live_only {
         let cache = build(mount, tip, stopped)?;
         // Inspect the actual identity again before publishing after a potentially long scan.
@@ -514,9 +528,6 @@ fn watch(
         }
         *data = Some(Index::new(cache));
         checkpoint(source, data.as_mut().unwrap(), &db)?;
-    } else {
-        // Persist a renamed mount point even if its event journal has no new file events.
-        dirty = read_snapshot_header(&db).is_ok_and(|h| h.path != mount.path);
     }
     {
         let data = source.index.lock();

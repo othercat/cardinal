@@ -30,7 +30,9 @@ export function sortedWindow(
     const kind = metadata ? (metadata.type === 1 ? 0 : 1) : 2;
     const numeric =
       key === 'size'
-        ? item.size
+        ? metadata?.type === 1
+          ? -1
+          : metadata?.allocatedSize
         : key === 'mtime'
           ? item.mtime || undefined
           : item.ctime || undefined;

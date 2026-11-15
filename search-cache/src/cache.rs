@@ -4,7 +4,7 @@ mod event_replay;
 mod path_rules;
 use crate::{
     FileNodes, NameIndex, SearchOptions, SearchResultNode, SlabIndex, SlabNode,
-    SlabNodeMetadataCompact, State, ThinSlab,
+    SlabNodeMetadataCompact, ThinSlab,
     highlight::derive_highlight_terms,
     persistent::{
         PersistentStorage, SnapshotHeader, read_cache_from_file_with_cancel,
@@ -160,7 +160,7 @@ impl SearchCache {
                 // An atomic replacement may occur between the cheap probe and
                 // the full read. Recheck the configuration actually decoded.
                 let header = SnapshotHeader {
-                    source_version: 6,
+                    source_version: crate::LSF_VERSION,
                     last_event_id: storage.last_event_id,
                     path: storage.path.clone(),
                     ignore_paths: storage.ignore_paths.clone(),
@@ -932,6 +932,7 @@ impl SearchCache {
         &mut self,
         nodes: &[SlabIndex],
     ) -> Vec<SearchResultNode> {
+        let fetch = FETCH_META && !self.file_nodes.index_only();
         nodes
             .iter()
             .copied()
@@ -941,18 +942,13 @@ impl SearchCache {
                     .file_nodes
                     .get_mut(node_index)
                     .map(|node| {
-                        match (node.state(), &path) {
-                            (State::None, Some(path)) if FETCH_META => {
-                                // try fetching metadata if it's not cached and cache them
-                                let metadata = match std::fs::symlink_metadata(path) {
-                                    Ok(metadata) => SlabNodeMetadataCompact::some(metadata.into()),
-                                    Err(_) => SlabNodeMetadataCompact::unaccessible(),
-                                };
-                                node.metadata = metadata;
-                                metadata
-                            }
-                            _ => node.metadata,
+                        if fetch
+                            && node.metadata.needs_hydration(true)
+                            && let Some(path) = &path
+                        {
+                            node.metadata.hydrate_path(path);
                         }
+                        node.metadata
                     })
                     .unwrap_or_else(SlabNodeMetadataCompact::unaccessible);
                 SearchResultNode {
@@ -1090,7 +1086,7 @@ fn require_folder_expr(expr: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::CONTENT_BUFFER_BYTES;
+    use crate::{State, query::CONTENT_BUFFER_BYTES};
     use fswalk::{NodeFileType, walk_it_without_root_chain};
     use std::{
         fs,

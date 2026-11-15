@@ -139,7 +139,8 @@ describe('App live refresh and sorting integration', () => {
             path: paths[id] ?? `/files/file-${String(id).padStart(3, '0')}.txt`,
             metadata: {
               type: 0,
-              size: sizes[id] ?? id,
+              size: 1_000_000 - (sizes[id] ?? id),
+              allocatedSize: sizes[id] ?? id,
               mtime: [300, 100, 200][id] ?? id,
               ctime: [200, 300, 100][id] ?? id,
             },

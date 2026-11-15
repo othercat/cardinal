@@ -60,6 +60,7 @@ pub struct MetadataPlan(Vec<MissingDirectory>);
 type MissingByParent = HashMap<Option<SlabIndex>, Vec<(SlabIndex, &'static str)>>;
 
 pub struct MetadataPlanner {
+    disk_usage: bool,
     ids: std::vec::IntoIter<SlabIndex>,
     grouping: MissingByParent,
     parents: Option<<MissingByParent as IntoIterator>::IntoIter>,
@@ -68,7 +69,12 @@ pub struct MetadataPlanner {
 
 impl MetadataPlanner {
     pub fn new(ids: &[SlabIndex]) -> Self {
+        Self::for_sort(ids, SortKey::Size)
+    }
+
+    pub fn for_sort(ids: &[SlabIndex], key: SortKey) -> Self {
         Self {
+            disk_usage: key == SortKey::Size,
             ids: Vec::from(ids).into_iter(),
             grouping: HashMap::new(),
             parents: None,
@@ -84,7 +90,7 @@ impl MetadataPlanner {
             if self.ids.len() > 0 {
                 for id in self.ids.by_ref().take(2048) {
                     if let Some(node) = cache.file_nodes.get(id)
-                        && node.metadata.is_none()
+                        && node.metadata.needs_hydration(self.disk_usage)
                     {
                         self.grouping.entry(node.parent()).or_default().push((
                             id,
@@ -215,7 +221,8 @@ impl NumericOrder {
 fn numeric_value(meta: crate::SlabNodeMetadataCompact, key: SortKey) -> i64 {
     meta.as_ref()
         .map(|m| match key {
-            SortKey::Size => m.size(),
+            SortKey::Size if m.r#type() == NodeFileType::Dir => -1,
+            SortKey::Size => m.allocated_size().unwrap_or(i64::MIN),
             SortKey::Mtime => m.mtime().map(|v| i64::from(v.get())).unwrap_or(i64::MIN),
             SortKey::Ctime => m.ctime().map(|v| i64::from(v.get())).unwrap_or(i64::MIN),
             _ => 0,
@@ -349,7 +356,7 @@ impl SearchCache {
             let value = numeric_value(meta, key);
             let missing_value = value == i64::MIN;
             missing += usize::from(missing_value);
-            to_hydrate += usize::from(meta.is_none());
+            to_hydrate += usize::from(meta.needs_hydration(key == SortKey::Size));
             rows.push(NumericRow {
                 id,
                 value,
@@ -374,9 +381,9 @@ impl SearchCache {
             if let Some(node) = self.file_nodes.get_mut(row.id)
                 && node.parent() == row.parent
                 && (node.name() == row.name || row.parent.is_none())
-                && node.metadata.is_none()
+                && node.metadata.needs_hydration(true)
             {
-                node.metadata = row.metadata;
+                node.metadata.apply_hydration(row.metadata);
             }
         }
     }
@@ -399,7 +406,7 @@ impl SearchCache {
         token.is_cancelled()?;
         let numeric_key = matches!(key, SortKey::Size | SortKey::Mtime | SortKey::Ctime);
         if numeric_key && !self.file_nodes.index_only() {
-            self.warm_sort_metadata(indices, token)?;
+            self.warm_sort_metadata(indices, key, token)?;
         }
         let mut entries = Vec::with_capacity(indices.len());
         let mut directories = HashMap::new();
@@ -419,13 +426,14 @@ impl SearchCache {
     fn warm_sort_metadata(
         &mut self,
         indices: &[SlabIndex],
+        key: SortKey,
         token: CancellationToken,
     ) -> Option<()> {
         let mut counts = HashMap::<SlabIndex, usize>::new();
         for (i, &id) in indices.iter().enumerate() {
             token.is_cancelled_sparse(i)?;
             if let Some(node) = self.file_nodes.get(id)
-                && node.metadata.is_none()
+                && node.metadata.needs_hydration(key == SortKey::Size)
                 && let Some(parent) = node.parent()
             {
                 *counts.entry(parent).or_default() += 1;
@@ -448,7 +456,9 @@ impl SearchCache {
                 .iter()
                 .filter_map(|&id| {
                     let node = &self.file_nodes[id];
-                    node.metadata.is_none().then_some((node.name(), id))
+                    node.metadata
+                        .needs_hydration(key == SortKey::Size)
+                        .then_some((node.name(), id))
                 })
                 .collect();
             for entry in entries {
@@ -494,7 +504,7 @@ impl SearchCache {
             ("/", Arc::from(""))
         };
         let metadata = if numeric_key {
-            self.ensure_metadata(index)
+            self.ensure_metadata(index, key == SortKey::Size)
         } else {
             node.metadata
         };
@@ -746,6 +756,7 @@ mod tests {
         SlabNodeMetadataCompact::some(NodeMetadata {
             r#type: kind,
             size,
+            allocated_size: size,
             mtime: NonZeroU64::new(mtime),
             ctime: NonZeroU64::new(ctime),
         })
@@ -972,7 +983,7 @@ mod tests {
         cache.file_nodes[first[0]].metadata = SlabNodeMetadataCompact::unaccessible();
         sorted(&mut cache, &ids, SortKey::Size, SortDirection::Asc);
         assert!(cache.file_nodes[first[0]].metadata.is_unaccessible());
-        fs::write(&a, b"aaaaaaaa").unwrap();
+        fs::write(&a, vec![b'a'; 128 * 1024]).unwrap();
         let event_id = cache.last_event_id() + 1;
         cache
             .handle_fs_events(vec![FsEvent {
@@ -989,7 +1000,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .size(),
-            8
+            128 * 1024
         );
     }
 

@@ -32,7 +32,7 @@
   "columns": {
     "filename": "文件名",
     "path": "路径",
-    "size": "大小",
+    "size": "磁盘占用",
     "modified": "修改时间",
     "created": "创建时间"
   },

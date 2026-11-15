@@ -774,7 +774,7 @@ impl SearchCache {
             if node.file_type_hint() != NodeFileType::File {
                 return false;
             }
-            let metadata = self.ensure_metadata(index);
+            let metadata = self.ensure_metadata(index, false);
             let Some(meta) = metadata.as_ref() else {
                 return false;
             };
@@ -1049,7 +1049,7 @@ impl SearchCache {
     }
 
     fn node_timestamp(&mut self, index: SlabIndex, field: DateField) -> Option<i64> {
-        let metadata = self.ensure_metadata(index);
+        let metadata = self.ensure_metadata(index, false);
         let meta = metadata.as_ref()?;
         match field {
             DateField::Modified => meta.mtime(),
@@ -1058,20 +1058,20 @@ impl SearchCache {
         .map(|value| value.get() as i64)
     }
 
-    pub(crate) fn ensure_metadata(&mut self, index: SlabIndex) -> SlabNodeMetadataCompact {
+    pub(crate) fn ensure_metadata(
+        &mut self,
+        index: SlabIndex,
+        disk_usage: bool,
+    ) -> SlabNodeMetadataCompact {
         let current = self.file_nodes[index].metadata;
-        if !current.is_none() || self.file_nodes.index_only() {
+        if !current.needs_hydration(disk_usage) || self.file_nodes.index_only() {
             return current;
         }
         let path = self
             .node_path(index)
             .expect("node index is not present in slab");
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(data) => SlabNodeMetadataCompact::some(data.into()),
-            Err(_) => SlabNodeMetadataCompact::unaccessible(),
-        };
-        self.file_nodes[index].metadata = metadata;
-        metadata
+        self.file_nodes[index].metadata.hydrate_path(&path);
+        self.file_nodes[index].metadata
     }
 }
 

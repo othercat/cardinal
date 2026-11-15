@@ -213,6 +213,7 @@ export function useDataLoader(
           existing.ctime === mergedItem.ctime &&
           existing.metadata?.type === mergedItem.metadata?.type &&
           existing.metadata?.size === mergedItem.metadata?.size &&
+          existing.metadata?.allocatedSize === mergedItem.metadata?.allocatedSize &&
           existing.metadata?.mtime === mergedItem.metadata?.mtime &&
           existing.metadata?.ctime === mergedItem.metadata?.ctime
         )

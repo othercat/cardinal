@@ -3,8 +3,8 @@
 //! directories need a lookup table, including parents whose records arrive late.
 
 use super::{
-    AttrList, CRTIME, DATALENGTH, FLAGS, MODTIME, NAME, OBJTYPE, i64_at, invalid_record, timestamp,
-    u32_at,
+    ALLOCSIZE, AttrList, CRTIME, DATALENGTH, FLAGS, MODTIME, NAME, OBJTYPE, i64_at, invalid_record,
+    timestamp, u32_at,
 };
 use crate::{Node, NodeFileType, NodeMetadata};
 use std::{
@@ -129,7 +129,7 @@ fn insert_record(catalog: &mut Catalog, bytes: &[u8]) -> io::Result<()> {
         .and_then(|b| CStr::from_bytes_with_nul(b).ok())
         .and_then(|s| s.to_str().ok())
         .ok_or_else(invalid_record)?;
-    if start < 76 || name.is_empty() || name == "." || name == ".." || name.contains('/') {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
         return Err(invalid_record());
     }
     let kind = match u32_at(bytes, 12)? {
@@ -148,10 +148,17 @@ fn insert_record(catalog: &mut Catalog, bytes: &[u8]) -> io::Result<()> {
         return Err(invalid_record());
     }
     let dir = kind == NodeFileType::Dir;
-    let size = if dir {
-        0
+    let fixed_end = if dir { 76 } else { 84 };
+    if start < fixed_end {
+        return Err(invalid_record());
+    }
+    let (allocated_size, size) = if dir {
+        (0, 0)
     } else {
-        u64::try_from(i64_at(bytes, 68)?).map_err(|_| invalid_record())?
+        (
+            u64::try_from(i64_at(bytes, 68)?).map_err(|_| invalid_record())?,
+            u64::try_from(i64_at(bytes, 76)?).map_err(|_| invalid_record())?,
+        )
     };
     let flags = u32_at(bytes, 48)?;
     let node = Node {
@@ -162,6 +169,7 @@ fn insert_record(catalog: &mut Catalog, bytes: &[u8]) -> io::Result<()> {
             Some(NodeMetadata {
                 r#type: kind,
                 size,
+                allocated_size,
                 ctime: timestamp(bytes, 16)?,
                 mtime: timestamp(bytes, 32)?,
             })
@@ -292,7 +300,7 @@ pub fn walk_hfs_catalog(root: &Path, cancelled: impl Fn() -> bool) -> io::Result
     let mut fields = attrs(
         NAME | OBJTYPE | CRTIME | MODTIME | FLAGS | FILEID | PARENTID,
         DIR_LINKCOUNT | DIR_ENTRYCOUNT,
-        DATALENGTH,
+        ALLOCSIZE | DATALENGTH,
     );
     let mut block = SearchBlock {
         return_attrs: &mut fields,
@@ -414,9 +422,9 @@ mod tests {
         let start = Instant::now();
         let walk = walk_it_without_root_chain(&WalkData::simple(root, true)).unwrap();
         let walk_elapsed = start.elapsed();
-        let mut pairs = vec![(&catalog, &walk)];
+        let mut pairs = vec![(&catalog, &walk, root.to_path_buf())];
         let mut count = 0;
-        while let Some((actual, expected)) = pairs.pop() {
+        while let Some((actual, expected, path)) = pairs.pop() {
             count += 1;
             assert_eq!(actual.name, expected.name);
             assert_eq!(
@@ -430,9 +438,9 @@ mod tests {
                     (
                         m.r#type,
                         if m.r#type == NodeFileType::Dir {
-                            0
+                            (0, 0)
                         } else {
-                            m.size
+                            (m.size, m.allocated_size)
                         },
                         m.ctime,
                         m.mtime,
@@ -440,7 +448,23 @@ mod tests {
                 })
             };
             assert_eq!(metadata(actual), metadata(expected), "{}", actual.name);
-            pairs.extend(actual.children.iter().zip(&expected.children));
+            if let Some(m) = actual.metadata
+                && m.r#type != NodeFileType::Dir
+            {
+                assert_eq!(
+                    m.allocated_size,
+                    fs::symlink_metadata(&path).unwrap().blocks() * 512,
+                    "{}",
+                    path.display(),
+                );
+            }
+            pairs.extend(
+                actual
+                    .children
+                    .iter()
+                    .zip(&expected.children)
+                    .map(|(a, e)| (a, e, path.join(a.name.as_ref()))),
+            );
         }
         eprintln!(
             "{count} matching entries; searchfs {catalog_elapsed:?}, directory walk {walk_elapsed:?}"

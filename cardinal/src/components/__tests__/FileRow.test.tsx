@@ -15,6 +15,16 @@ const renderRow = (props?: Partial<React.ComponentProps<typeof FileRow>>) => {
 };
 
 describe('FileRow selection interactions', () => {
+  it.each([
+    [8_545_845_248, '8.55 GB'],
+    [0, '0 B'],
+    [null, '—'],
+  ] as const)('shows allocated bytes %s for a sparse 1 TiB file', (allocatedSize, expected) => {
+    const metadata = { ...baseItem.metadata, size: 2 ** 40, allocatedSize };
+    const { container } = renderRow({ item: { path: '/vm/Docker.raw', metadata } });
+    expect(container.querySelector('.size-text')).toHaveTextContent(expected);
+  });
+
   it('does not send redundant selection updates for a plain click on an already-selected row', () => {
     const onSelect = vi.fn();
     const { getByTitle } = renderRow({ onSelect });

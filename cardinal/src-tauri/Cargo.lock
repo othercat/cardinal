@@ -3713,6 +3713,7 @@ dependencies = [
  "search-cancel",
  "serde",
  "slab-mmap",
+ "tempfile",
  "thin-vec",
  "tracing",
  "typed-num",

@@ -1,4 +1,6 @@
-use crate::{SlabIndex, SlabNode, ThinSlab, name_index::SortedSlabIndices};
+use crate::{
+    SlabIndex, SlabNode, ThinSlab, name_index::SortedSlabIndices, slab_node::LegacyNodeMetadata,
+};
 use anyhow::{Context, Result, bail, ensure};
 use hashbrown::HashSet;
 use serde::{Deserialize, Serialize};
@@ -15,7 +17,7 @@ use std::{
 use tracing::info;
 use typed_num::Num;
 
-const LSF_VERSION: i64 = 6;
+pub const LSF_VERSION: i64 = 7;
 
 #[derive(Serialize, Deserialize)]
 pub struct PersistentStorage {
@@ -36,16 +38,12 @@ pub struct PersistentStorage {
     pub rescan_count: u64,
 }
 
-// Verified against the source immediately before 78b3bde: v6 added only
-// include_paths. Old snapshots have no include overrides; do not guess any
-// other historical layouts or silently reinterpret a newer version.
-#[derive(Serialize, Deserialize)]
-struct LegacyStorageV5 {
-    version: Num<5>,
-    last_event_id: u64,
-    path: PathBuf,
-    ignore_paths: Vec<PathBuf>,
+// v5 and v6 share this body. v6 added include_paths to the header.
+// v7 adds allocated size to each node, preserving legacy paths, IDs and cursors.
+#[derive(Deserialize)]
+struct LegacyBody {
     slab_root: SlabIndex,
+    #[serde(deserialize_with = "ThinSlab::deserialize_from::<SlabNode<LegacyNodeMetadata>, _>")]
     slab: ThinSlab<SlabNode>,
     name_index: BTreeMap<Box<str>, SortedSlabIndices>,
     rescan_count: u64,
@@ -63,8 +61,8 @@ pub struct SnapshotHeader {
 }
 
 #[derive(Deserialize)]
-struct HeaderV6 {
-    _version: Num<6>,
+struct HeaderWithIncludes<const V: i64> {
+    _version: Num<V>,
     last_event_id: u64,
     path: PathBuf,
     ignore_paths: Vec<PathBuf>,
@@ -77,6 +75,30 @@ struct HeaderV5 {
     last_event_id: u64,
     path: PathBuf,
     ignore_paths: Vec<PathBuf>,
+}
+
+impl<const V: i64> From<HeaderWithIncludes<V>> for SnapshotHeader {
+    fn from(header: HeaderWithIncludes<V>) -> Self {
+        Self {
+            source_version: V,
+            last_event_id: header.last_event_id,
+            path: header.path,
+            ignore_paths: header.ignore_paths,
+            include_paths: header.include_paths,
+        }
+    }
+}
+
+impl From<HeaderV5> for SnapshotHeader {
+    fn from(header: HeaderV5) -> Self {
+        Self {
+            source_version: 5,
+            last_event_id: header.last_event_id,
+            path: header.path,
+            ignore_paths: header.ignore_paths,
+            include_paths: vec![],
+        }
+    }
 }
 
 impl SnapshotHeader {
@@ -158,28 +180,30 @@ pub(crate) fn read_snapshot_header_with_cancel(
 ) -> Result<SnapshotHeader> {
     let version: i64 = decode(path, false, cancel)?;
     match version {
-        6 => {
-            let header: HeaderV6 = decode(path, false, cancel)?;
-            Ok(SnapshotHeader {
-                source_version: 6,
-                last_event_id: header.last_event_id,
-                path: header.path,
-                ignore_paths: header.ignore_paths,
-                include_paths: header.include_paths,
-            })
-        }
-        5 => {
-            let header: HeaderV5 = decode(path, false, cancel)?;
-            Ok(SnapshotHeader {
-                source_version: 5,
-                last_event_id: header.last_event_id,
-                path: header.path,
-                ignore_paths: header.ignore_paths,
-                include_paths: vec![],
-            })
-        }
+        7 => decode::<HeaderWithIncludes<7>>(path, false, cancel).map(Into::into),
+        6 => decode::<HeaderWithIncludes<6>>(path, false, cancel).map(Into::into),
+        5 => decode::<HeaderV5>(path, false, cancel).map(Into::into),
         _ => bail!("Unsupported snapshot version: {version}"),
     }
+}
+
+fn read_legacy<H: serde::de::DeserializeOwned + Into<SnapshotHeader>>(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<PersistentStorage> {
+    let (header, old): (H, LegacyBody) = decode(path, true, cancel)?;
+    let header = header.into();
+    Ok(PersistentStorage {
+        version: Num,
+        last_event_id: header.last_event_id,
+        path: header.path,
+        ignore_paths: header.ignore_paths,
+        include_paths: header.include_paths,
+        slab_root: old.slab_root,
+        slab: old.slab,
+        name_index: old.name_index,
+        rescan_count: old.rescan_count,
+    })
 }
 
 pub fn read_cache_from_file(path: &Path) -> Result<PersistentStorage> {
@@ -193,21 +217,9 @@ pub(crate) fn read_cache_from_file_with_cancel(
     let cache_decode_time = Instant::now();
     let version: i64 = decode(path, false, cancel)?;
     let storage = match version {
-        6 => decode(path, true, cancel)?,
-        5 => {
-            let old: LegacyStorageV5 = decode(path, true, cancel)?;
-            PersistentStorage {
-                version: Num,
-                last_event_id: old.last_event_id,
-                path: old.path,
-                ignore_paths: old.ignore_paths,
-                include_paths: vec![],
-                slab_root: old.slab_root,
-                slab: old.slab,
-                name_index: old.name_index,
-                rescan_count: old.rescan_count,
-            }
-        }
+        7 => decode(path, true, cancel)?,
+        6 => read_legacy::<HeaderWithIncludes<6>>(path, cancel)?,
+        5 => read_legacy::<HeaderV5>(path, cancel)?,
         _ => bail!("Unsupported snapshot version: {version}"),
     };
     let validation_time = Instant::now();
@@ -320,6 +332,38 @@ impl Drop for TemporarySnapshot {
     }
 }
 
+// Keep the first pre-upgrade checkpoint for a downgrade. Local APFS/HFS+
+// snapshots use a hard link; custom CLI destinations can lack hard-link support.
+fn keep_legacy_snapshot(path: &Path, version: i64) -> Result<()> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".v{version}.bak"));
+    let backup = PathBuf::from(name);
+    let result = match fs::hard_link(path, &backup) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => {
+            let mut temporary =
+                tempfile::NamedTempFile::new_in(backup.parent().unwrap_or(Path::new(".")))?;
+            io::copy(&mut File::open(path)?, &mut temporary)?;
+            temporary.as_file().sync_all()?;
+            temporary
+                .persist_noclobber(&backup)
+                .map(|_| ())
+                .map_err(|e| e.error)
+        }
+    };
+    if let Err(error) = result {
+        ensure!(
+            error.kind() == io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&backup).is_ok_and(|m| m.is_file())
+                && read_snapshot_header(&backup).is_ok_and(|h| h.source_version == version),
+            "Cannot preserve pre-upgrade snapshot at {}: {error}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn write_cache_to_file(path: &Path, storage: &PersistentStorage) -> Result<()> {
     let cache_encode_time = Instant::now();
     let parent = path
@@ -333,9 +377,12 @@ pub fn write_cache_to_file(path: &Path, storage: &PersistentStorage) -> Result<(
     );
     if let Ok(version) = decode::<i64>(path, false, None) {
         ensure!(
-            matches!(version, 5 | 6),
+            (5..=LSF_VERSION).contains(&version),
             "Refusing to replace an unsupported snapshot version: {version}"
         );
+        if version < LSF_VERSION {
+            keep_legacy_snapshot(path, version)?;
+        }
     }
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let filename = path.file_name().context("Snapshot path has no filename")?;
@@ -426,13 +473,13 @@ mod tests {
     }
 
     #[test]
-    fn v6_roundtrip_and_configuration_are_checked_before_use() {
-        let dir = TempDir::new("snapshot_v6").unwrap();
+    fn current_roundtrip_and_configuration_are_checked_before_use() {
+        let dir = TempDir::new("snapshot_current").unwrap();
         let path = dir.path().join("db");
         let original = fixture();
         write_cache_to_file(&path, &original).unwrap();
         let header = read_snapshot_header(&path).unwrap();
-        assert_eq!(header.source_version, 6);
+        assert_eq!(header.source_version, LSF_VERSION);
         assert!(header.matches_configuration(
             &original.path,
             &[
@@ -487,30 +534,93 @@ mod tests {
     }
 
     #[test]
-    fn verified_v5_layout_migrates_with_empty_include_overrides() {
-        let dir = TempDir::new("snapshot_v5").unwrap();
-        let path = dir.path().join("v5");
-        let original = fixture();
-        let legacy = LegacyStorageV5 {
-            version: Num,
-            last_event_id: original.last_event_id,
-            path: original.path,
-            ignore_paths: original.ignore_paths,
-            slab_root: original.slab_root,
-            slab: original.slab,
-            name_index: original.name_index,
-            rescan_count: original.rescan_count,
-        };
-        raw_snapshot(&path, &postcard::to_stdvec(&legacy).unwrap());
-        assert_eq!(read_snapshot_header(&path).unwrap().source_version, 5);
-        let migrated = read_cache_from_file(&path).unwrap();
-        assert!(migrated.include_paths.is_empty());
-        assert_eq!(migrated.slab.len(), 3);
-        assert_eq!(migrated.last_event_id, legacy.last_event_id);
-        let output = dir.path().join("v6");
-        write_cache_to_file(&output, &migrated).unwrap();
-        assert_eq!(read_snapshot_header(&output).unwrap().source_version, 6);
-        assert_eq!(read_cache_from_file(&output).unwrap().slab.len(), 3);
+    fn v5_and_v6_migrate_in_place_with_the_original_node_ids_and_unknown_disk_usage() {
+        use crate::{OptionSlabIndex, StateTypeSize};
+        use fswalk::NodeFileType;
+        let dir = TempDir::new("legacy_allocation").unwrap();
+        let mut original = fixture();
+        original.include_paths.push("/fixture/ignored/keep".into());
+        let mut rows = BTreeMap::new();
+        for (id, node) in original.slab.iter() {
+            let kind = if node.children.is_empty() {
+                NodeFileType::File
+            } else {
+                NodeFileType::Dir
+            };
+            let old_metadata = (StateTypeSize::some(kind, 1 << 40), 100u32, 200u32);
+            rows.insert(
+                id.get(),
+                (
+                    (node.name(), OptionSlabIndex::from_option(node.parent())),
+                    &node.children,
+                    old_metadata,
+                ),
+            );
+        }
+        for version in [5i64, 6] {
+            let path = dir.path().join(format!("v{version}"));
+            let mut bytes = postcard::to_stdvec(&(
+                version,
+                original.last_event_id,
+                &original.path,
+                &original.ignore_paths,
+            ))
+            .unwrap();
+            if version == 6 {
+                bytes.extend(postcard::to_stdvec(&original.include_paths).unwrap());
+            }
+            bytes.extend(
+                postcard::to_stdvec(&(
+                    original.slab_root,
+                    &rows,
+                    &original.name_index,
+                    original.rescan_count,
+                ))
+                .unwrap(),
+            );
+            raw_snapshot(&path, &bytes);
+            assert_eq!(read_snapshot_header(&path).unwrap().source_version, version);
+            let mut migrated = read_cache_from_file(&path).unwrap();
+            assert_eq!(migrated.include_paths.is_empty(), version == 5);
+            assert_eq!(migrated.slab.len(), 3);
+            assert_eq!(migrated.last_event_id, original.last_event_id);
+            let file = migrated.slab.get_mut(SlabIndex::new(2)).unwrap();
+            assert_eq!(file.name(), "file.txt");
+            assert!(file.metadata.needs_hydration(true));
+            assert!(!file.metadata.needs_hydration(false));
+            assert_eq!(file.metadata.as_ref().unwrap().allocated_size(), None);
+            file.metadata.hydrate_path(&dir.path().join("unreadable"));
+            assert!(!file.metadata.needs_hydration(true));
+            assert_eq!(file.metadata.as_ref().unwrap().size(), 1 << 40);
+            assert_eq!(file.metadata.as_ref().unwrap().mtime().unwrap().get(), 200);
+            let sparse = dir.path().join("hole");
+            File::create(&sparse).unwrap().set_len(1 << 40).unwrap();
+            file.metadata.hydrate_path(&sparse);
+            assert_eq!(file.metadata.as_ref().unwrap().allocated_size(), Some(0));
+            write_cache_to_file(&path, &migrated).unwrap();
+            let backup = dir.path().join(format!("v{version}.v{version}.bak"));
+            assert_eq!(
+                read_snapshot_header(&backup).unwrap().source_version,
+                version
+            );
+            assert_eq!(
+                zstd::stream::decode_all(File::open(backup).unwrap()).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                read_snapshot_header(&path).unwrap().source_version,
+                LSF_VERSION
+            );
+            let saved = read_cache_from_file(&path).unwrap();
+            assert_eq!(
+                saved.slab[SlabIndex::new(2)]
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .allocated_size(),
+                Some(0)
+            );
+        }
     }
 
     #[test]
