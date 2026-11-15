@@ -1911,6 +1911,30 @@ button:active:not(:disabled) {
   resize: vertical;
 }
 
+.volume-exclusions {
+  list-style: none;
+  width: 260px;
+  max-height: 100px;
+  overflow: auto;
+  margin: 4px 0 0;
+  padding: 0;
+  text-align: left;
+}
+
+.volume-exclusions li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.volume-exclusions span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+
 .preferences-field-error {
   margin-bottom: 0;
 }

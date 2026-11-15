@@ -1,10 +1,14 @@
 use super::{Volume, Volumes};
 use crate::{background::view_page, commands::NodeInfoMetadata, sort::SortStatePayload};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use search_cache::{SearchCache, SearchOptions, SearchQuery, SlabIndex, SortDirection, SortKey};
 use search_cancel::CancellationToken;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::atomic::AtomicU64};
+use std::{
+    collections::HashSet,
+    path::{Component, PathBuf},
+    sync::atomic::AtomicU64,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +20,8 @@ pub(crate) struct VolumeQuery {
     pub offset: usize,
     pub limit: usize,
     pub request_id: u64,
+    #[serde(default)]
+    pub excluded_paths: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -44,17 +50,50 @@ struct Order {
 pub(super) struct Index {
     pub cache: SearchCache,
     order: Option<Order>,
+    excluded_paths: Vec<PathBuf>,
+    hidden: HashSet<SlabIndex>,
 }
 
 impl Index {
     pub fn new(cache: SearchCache) -> Self {
-        Self { cache, order: None }
+        Self {
+            cache,
+            order: None,
+            excluded_paths: vec![],
+            hidden: HashSet::new(),
+        }
     }
     pub fn changed(&mut self) {
         self.order = None;
+        self.excluded_paths.clear();
+        self.hidden.clear();
     }
 
     pub fn page(&mut self, request: VolumeQuery, token: CancellationToken) -> Result<VolumePage> {
+        if self.excluded_paths != request.excluded_paths {
+            let mut hidden = HashSet::new();
+            for path in &request.excluded_paths {
+                ensure!(
+                    !path.as_os_str().is_empty()
+                        && path.components().all(|c| matches!(c, Component::Normal(_))),
+                    "Expected a volume-relative exclusion"
+                );
+                if let Some(id) = self
+                    .cache
+                    .node_index_for_path(&self.cache.root_path().join(path))
+                    && hidden.insert(id)
+                {
+                    hidden.extend(
+                        self.cache
+                            .all_subnodes(id, token)
+                            .context("Search superseded")?,
+                    );
+                }
+            }
+            self.hidden = hidden;
+            self.excluded_paths = request.excluded_paths;
+            self.order = None;
+        }
         let query = SearchQuery {
             query: request.query,
             directory_query: request.directory_query,
@@ -72,6 +111,10 @@ impl Index {
                 token,
             )?;
             let mut ids = outcome.nodes.context("Search superseded")?;
+            if !self.hidden.is_empty() {
+                ids.retain(|id| !self.hidden.contains(id));
+                token.is_cancelled().context("Search superseded")?;
+            }
             let mut missing = 0;
             if let Some(key) = key {
                 ids = match key {
@@ -140,7 +183,7 @@ impl Index {
             .collect();
         Ok(VolumePage {
             total: order.ids.len(),
-            indexed: self.cache.get_total_files(),
+            indexed: self.cache.get_total_files() - self.hidden.len(),
             rows,
             highlights: order.highlights.clone(),
         })

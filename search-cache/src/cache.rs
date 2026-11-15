@@ -1,5 +1,7 @@
 #[path = "event_replay.rs"]
 mod event_replay;
+#[path = "path_rules.rs"]
+mod path_rules;
 use crate::{
     FileNodes, NameIndex, SearchOptions, SearchResultNode, SlabIndex, SlabNode,
     SlabNodeMetadataCompact, State, ThinSlab,
@@ -127,6 +129,12 @@ impl std::fmt::Debug for SearchCache {
 }
 
 impl SearchCache {
+    /// Absolute root used to resolve paths in this tree (the current mount point
+    /// for volume-relative snapshots).
+    pub fn root_path(&self) -> &Path {
+        self.file_nodes.tree_root()
+    }
+
     pub fn ignore_paths(&self) -> Box<[PathBuf]> {
         self.file_nodes.ignore_paths().clone().into_boxed_slice()
     }
@@ -806,6 +814,13 @@ impl SearchCache {
 
     /// Removes a node and its children recursively by index.
     fn remove_node(&mut self, index: SlabIndex) {
+        if let Some(parent) = self.file_nodes[index].parent() {
+            self.file_nodes[parent].children.retain(|&x| x != index);
+        }
+        self.remove_detached_subtree(index);
+    }
+
+    fn remove_detached_subtree(&mut self, index: SlabIndex) {
         fn remove_single_node(cache: &mut SearchCache, index: SlabIndex) {
             if let Some(node) = cache.file_nodes.try_remove(index) {
                 if let Some(changes) = &mut cache.view_changes {
@@ -817,10 +832,6 @@ impl SearchCache {
             }
         }
 
-        // Remove parent reference, make whole subtree unreachable.
-        if let Some(parent) = self.file_nodes[index].parent() {
-            self.file_nodes[parent].children.retain(|&x| x != index);
-        }
         let mut stack = vec![index];
         while let Some(current) = stack.pop() {
             stack.extend_from_slice(&self.file_nodes[current].children);
@@ -889,7 +900,7 @@ impl SearchCache {
         }
     }
 
-    pub fn last_event_id(&mut self) -> u64 {
+    pub fn last_event_id(&self) -> u64 {
         self.last_event_id
     }
 

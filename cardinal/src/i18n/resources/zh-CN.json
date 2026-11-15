@@ -62,7 +62,11 @@
     "copyFilenames": "复制文件名",
     "copyPath": "复制路径",
     "copyPaths": "复制路径",
-    "resetColumnWidths": "重置列宽"
+    "resetColumnWidths": "重置列宽",
+    "excludeFile": "排除此文件",
+    "excludeDirectory": "排除此文件夹",
+    "excludePath": "排除此路径",
+    "excludeParent": "排除上级文件夹"
   },
   "statusBar": {
     "metadataProgress": "正在补齐大小和时间 {{done}} / {{total}} · 缺值项排在末尾",
@@ -178,8 +182,11 @@
     "action": "开始初始化"
   },
   "ignorePaths": {
-    "label": "忽略路径",
-    "help": "每行一个路径；这些目录将不会被索引。",
+    "label": "排除路径",
+    "help": "每行一个文件或文件夹。排除文件夹会同时排除其内容。",
+    "volumeRules": "移动卷排除路径",
+    "remove": "移除",
+    "removeVolumeRule": "移除 {{path}}",
     "errors": {
       "absolute": "每个路径需以“/”或“~”开头。"
     }

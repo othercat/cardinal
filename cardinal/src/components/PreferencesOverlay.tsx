@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getWatchRootValidation, isPathInputValid } from '../utils/watchRoot';
+import { formatPathRule, parsePathRules, type VolumeExclusion } from '../utils/pathExclusions';
+import type { VolumeInfo } from '../hooks/useVolumes';
 import ThemeSwitcher from './ThemeSwitcher';
 import LanguageSwitcher from './LanguageSwitcher';
 
@@ -23,6 +25,9 @@ type PreferencesOverlayProps = {
   defaultIgnorePaths: string[];
   includePaths: string[];
   defaultIncludePaths: string[];
+  volumes?: VolumeInfo[];
+  volumeExclusions?: VolumeExclusion[];
+  onVolumeExclusionsChange?: (rules: VolumeExclusion[]) => void;
   onReset: () => void;
   themeResetToken: number;
 };
@@ -42,14 +47,18 @@ export function PreferencesOverlay({
   defaultIgnorePaths,
   includePaths,
   defaultIncludePaths,
+  volumes,
+  volumeExclusions,
+  onVolumeExclusionsChange,
   onReset,
   themeResetToken,
 }: PreferencesOverlayProps): React.JSX.Element | null {
   const { t } = useTranslation();
   const [thresholdInput, setThresholdInput] = useState<string>(() => sortThreshold.toString());
   const [watchRootInput, setWatchRootInput] = useState<string>(() => watchRoot);
-  const [ignorePathsInput, setIgnorePathsInput] = useState<string>(() => ignorePaths.join('\n'));
-  const [includePathsInput, setIncludePathsInput] = useState<string>(() => includePaths.join('\n'));
+  const [ignorePathsInput, setIgnorePathsInput] = useState<string>('');
+  const [includePathsInput, setIncludePathsInput] = useState<string>('');
+  const [volumeInput, setVolumeInput] = useState<VolumeExclusion[]>([]);
 
   useEffect(() => {
     if (!open) {
@@ -79,9 +88,10 @@ export function PreferencesOverlay({
       return;
     }
     setWatchRootInput(watchRoot);
-    setIgnorePathsInput(ignorePaths.join('\n'));
-    setIncludePathsInput(includePaths.join('\n'));
-  }, [open, watchRoot, ignorePaths, includePaths]);
+    setIgnorePathsInput(ignorePaths.map(formatPathRule).join('\n'));
+    setIncludePathsInput(includePaths.map(formatPathRule).join('\n'));
+    setVolumeInput(volumeExclusions ?? []);
+  }, [open, watchRoot, ignorePaths, includePaths, volumeExclusions]);
 
   const commitThreshold = useCallback(() => {
     const numericText = thresholdInput.replace(/[^\d]/g, '');
@@ -109,19 +119,13 @@ export function PreferencesOverlay({
   const { errorKey: watchRootErrorKey } = getWatchRootValidation(watchRootInput);
   const watchRootErrorMessage = watchRootErrorKey ? t(watchRootErrorKey) : null;
 
-  const parsedIgnorePaths = ignorePathsInput
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+  const parsedIgnorePaths = parsePathRules(ignorePathsInput);
   const ignorePathsErrorMessage = (() => {
     const invalid = parsedIgnorePaths.find((line) => !isPathInputValid(line));
     return invalid ? t('ignorePaths.errors.absolute') : null;
   })();
 
-  const parsedIncludePaths = includePathsInput
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+  const parsedIncludePaths = parsePathRules(includePathsInput);
   const includePathsErrorMessage = (() => {
     const invalid = parsedIncludePaths.find((line) => !isPathInputValid(line));
     return invalid ? t('includePaths.errors.absolute') : null;
@@ -139,16 +143,16 @@ export function PreferencesOverlay({
       includePaths: parsedIncludePaths,
     });
     setWatchRootInput(trimmedWatchRoot);
-    setIgnorePathsInput(parsedIgnorePaths.join('\n'));
-    setIncludePathsInput(parsedIncludePaths.join('\n'));
+    if (volumeInput !== volumeExclusions) onVolumeExclusionsChange?.(volumeInput);
     onClose();
   };
 
   const handleReset = (): void => {
     setThresholdInput(defaultSortThreshold.toString());
     setWatchRootInput(defaultWatchRoot);
-    setIgnorePathsInput(defaultIgnorePaths.join('\n'));
-    setIncludePathsInput(defaultIncludePaths.join('\n'));
+    setIgnorePathsInput(defaultIgnorePaths.map(formatPathRule).join('\n'));
+    setIncludePathsInput(defaultIncludePaths.map(formatPathRule).join('\n'));
+    setVolumeInput([]);
     onReset();
   };
 
@@ -265,6 +269,27 @@ export function PreferencesOverlay({
                   {ignorePathsErrorMessage}
                 </p>
               ) : null}
+              {volumeInput.length > 0 && (
+                <ul className="volume-exclusions" aria-label={t('ignorePaths.volumeRules')}>
+                  {volumeInput.map((rule) => {
+                    const mount =
+                      volumes?.find((v) => v.id === rule.volumeId)?.path ?? rule.mountPath;
+                    const path = formatPathRule(mount + '/' + rule.relativePath);
+                    return (
+                      <li key={JSON.stringify([rule.volumeId, rule.relativePath])}>
+                        <span title={`${path} (${rule.volumeId})`}>{path}</span>
+                        <button
+                          type="button"
+                          aria-label={t('ignorePaths.removeVolumeRule', { path })}
+                          onClick={() => setVolumeInput((rules) => rules.filter((r) => r !== rule))}
+                        >
+                          {t('ignorePaths.remove')}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
           </div>
           <div className="preferences-row">

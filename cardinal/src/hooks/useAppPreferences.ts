@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { homeDir } from '@tauri-apps/api/path';
 import type { i18n as I18nInstance } from 'i18next';
 import { OPEN_PREFERENCES_EVENT } from '../constants/appEvents';
 import { getBrowserLanguage } from '../i18n/config';
@@ -11,6 +13,15 @@ import type { FullDiskAccessStatus } from './useFullDiskAccessPermission';
 import { useIgnorePaths } from './useIgnorePaths';
 import { useIncludePaths } from './useIncludePaths';
 import { useWatchRoot } from './useWatchRoot';
+import {
+  absoluteRule,
+  isBelow,
+  readVolumeExclusions,
+  type VolumeExclusion,
+} from '../utils/pathExclusions';
+import type { VolumeInfo } from './useVolumes';
+import { useStableEvent } from './useStableEvent';
+import { useStoredState } from './useStoredState';
 
 type WatchConfigChangePayload = {
   watchRoot: string;
@@ -38,6 +49,10 @@ type UseAppPreferencesResult = {
   defaultIncludePaths: string[];
   preferencesResetToken: number;
   handleWatchConfigChange: (next: WatchConfigChangePayload) => void;
+  home: string;
+  excludePath: (path: string, volume?: Pick<VolumeInfo, 'id' | 'path'>) => void;
+  volumeExclusions: VolumeExclusion[];
+  setVolumeExclusions: (next: VolumeExclusion[]) => void;
   handleResetPreferences: () => void;
 };
 
@@ -57,6 +72,42 @@ export function useAppPreferences({
   const { watchRoot, setWatchRoot, defaultWatchRoot } = useWatchRoot();
   const { ignorePaths, setIgnorePaths, defaultIgnorePaths } = useIgnorePaths();
   const { includePaths, setIncludePaths, defaultIncludePaths } = useIncludePaths();
+  const [home, setHome] = useState('');
+  const [volumeExclusions, storeVolumeExclusions] = useStoredState<VolumeExclusion[]>({
+    key: 'cardinal.volumeExclusions',
+    defaultValue: [],
+    read: readVolumeExclusions,
+    write: JSON.stringify,
+    readErrorMessage: 'Unable to read volume exclusions',
+    writeErrorMessage: 'Unable to save volume exclusions',
+  });
+  const volumeRules = useRef(volumeExclusions);
+  const setVolumeExclusions = useCallback(
+    (next: VolumeExclusion[]) => {
+      volumeRules.current = next;
+      storeVolumeExclusions(next);
+    },
+    [storeVolumeExclusions],
+  );
+  const config = useRef({ watchRoot, ignorePaths, includePaths });
+  const pendingConfig = useRef(Promise.resolve());
+  const refreshLatest = useStableEvent(refreshSearchResults);
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let alive = true;
+    void homeDir()
+      .then((dir) => {
+        if (alive) setHome(dir);
+      })
+      .catch(console.error);
+    const subscription = listen('watch_config_applied', () => {
+      if (alive) refreshLatest();
+    });
+    return () => {
+      alive = false;
+      void subscription.then((off) => off()).catch(console.error);
+    };
+  }, [refreshLatest]);
   const logicStartedRef = useRef(false);
   const [isPreferencesOpen, setIsPreferencesOpen] = useState(false);
   const [trayIconEnabled, setTrayIconEnabled] = useState<boolean>(() => getStoredTrayIconEnabled());
@@ -98,35 +149,60 @@ export function useAppPreferences({
   const applyWatchConfig = useCallback(
     (nextWatchRoot: string, nextIgnorePaths: string[], nextIncludePaths: string[]) => {
       const watchConfigChanged =
-        nextWatchRoot !== watchRoot ||
-        !areStringArraysEqual(nextIgnorePaths, ignorePaths) ||
-        !areStringArraysEqual(nextIncludePaths, includePaths);
+        nextWatchRoot !== config.current.watchRoot ||
+        !areStringArraysEqual(nextIgnorePaths, config.current.ignorePaths) ||
+        !areStringArraysEqual(nextIncludePaths, config.current.includePaths);
 
       if (!watchConfigChanged) {
         return;
       }
 
+      config.current = {
+        watchRoot: nextWatchRoot,
+        ignorePaths: nextIgnorePaths,
+        includePaths: nextIncludePaths,
+      };
       setWatchRoot(nextWatchRoot);
       setIgnorePaths(nextIgnorePaths);
       setIncludePaths(nextIncludePaths);
       if (logicStartedRef.current && nextWatchRoot) {
-        void setWatchConfig({
-          watchRoot: nextWatchRoot,
-          ignorePaths: nextIgnorePaths,
-          includePaths: nextIncludePaths,
-        });
+        const next = config.current;
+        pendingConfig.current = pendingConfig.current
+          .then(() => setWatchConfig(next))
+          .catch(console.error);
       }
-      refreshSearchResults();
     },
-    [
-      ignorePaths,
-      includePaths,
-      refreshSearchResults,
-      setIgnorePaths,
-      setIncludePaths,
-      setWatchRoot,
-      watchRoot,
-    ],
+    [setIgnorePaths, setIncludePaths, setWatchRoot],
+  );
+
+  const excludePath = useCallback(
+    (path: string, volume?: Pick<VolumeInfo, 'id' | 'path'>) => {
+      if (volume) {
+        if (!isBelow(path, volume.path)) return;
+        const relativePath = path.slice(volume.path.length + 1);
+        const existing = volumeRules.current;
+        if (
+          !existing.some(
+            (rule) => rule.volumeId === volume.id && rule.relativePath === relativePath,
+          )
+        ) {
+          setVolumeExclusions([
+            ...existing,
+            { volumeId: volume.id, mountPath: volume.path, relativePath },
+          ]);
+        }
+        return;
+      }
+      const current = config.current;
+      if (!isBelow(path, absoluteRule(current.watchRoot, home))) return;
+      const samePath = (rule: string) => absoluteRule(rule, home) === path;
+      applyWatchConfig(
+        current.watchRoot,
+        current.ignorePaths.some(samePath) ? current.ignorePaths : [...current.ignorePaths, path],
+        current.includePaths.filter((rule) => !samePath(rule)),
+      );
+    },
+    [home, applyWatchConfig, setVolumeExclusions],
   );
 
   const handleWatchConfigChange = useCallback(
@@ -160,6 +236,10 @@ export function useAppPreferences({
     defaultIncludePaths,
     preferencesResetToken,
     handleWatchConfigChange,
+    home,
+    excludePath,
+    volumeExclusions,
+    setVolumeExclusions,
     handleResetPreferences,
   };
 }

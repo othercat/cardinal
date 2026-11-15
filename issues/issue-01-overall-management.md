@@ -11,6 +11,7 @@
 | [#2](issue-02-apple-silicon-search-performance.md) | 合并项目规范、Apple Silicon/macOS 15+ 独立应用、大结果集排序与搜索性能 | r4（0.1.26）已交付。旧库约 698 万项属性实测 172.863 秒补齐，重启后就绪时大结果集首次切换数值列约 0.8 秒，历史回放和重扫可延长等待 | 无 |
 | [#3](issue-03-removable-volume-search.md) | HFS+、移动卷插拔和本机离线索引 | r5（0.1.27）已合入 `master`。HFS+、HFSX、APFS 映像及窗口离线重启验证通过，待实体移动硬盘实测 | #2 |
 | [#4](issue-04-small-file-event-cpu.md) | 频繁小文件写入时的 CPU 和索引更新延迟 | r6（0.1.28）已合入 `master`。每秒 2,560 次冷门小文件覆写的前台整组 CPU 为 136.55% → 8.21%，待日常全盘验收 | #2、#3 |
+| [#5](issue-05-context-path-exclusions.md) | 右键排除文件或父目录，评估 Spotlight 对文件名搜索的影响 | r7（0.1.29）已在本机交付。原生菜单、撤销、重启、离线卷与旧库副本通过验证，待日常使用验收 | #2、#3、#4 |
 
 ## 历史产物
 

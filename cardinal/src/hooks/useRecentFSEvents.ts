@@ -9,12 +9,14 @@ type RecentEventsOptions = {
   caseSensitive: boolean;
   isActive: boolean;
   eventFilterQuery: string;
+  showPath?: (path: string) => boolean;
 };
 
 export function useRecentFSEvents({
   caseSensitive,
   isActive,
   eventFilterQuery,
+  showPath,
 }: RecentEventsOptions) {
   const eventsRef = useRef<RecentEventPayload[]>([]);
   const nextSlot = useRef(0);
@@ -44,18 +46,33 @@ export function useRecentFSEvents({
     return unlistenEvents;
   }, []);
 
+  // The ring keeps original events. Recheck each resident event only once per rule change.
+  const visibleEvent = useMemo(() => {
+    const decisions = new WeakMap<RecentEventPayload, boolean>();
+    return (event: RecentEventPayload) => {
+      if (!showPath) return true;
+      let allowed = decisions.get(event);
+      if (allowed === undefined) {
+        allowed = showPath(event.path);
+        decisions.set(event, allowed);
+      }
+      return allowed;
+    };
+  }, [showPath]);
   const filteredEvents = useMemo(() => {
     if (!isActive) return [];
     const buffer = eventsRef.current;
     const start = buffer.length === MAX_EVENTS ? nextSlot.current : 0;
     const events = start ? buffer.slice(start).concat(buffer.slice(0, start)) : buffer.slice();
     const query = eventFilterQuery.trim();
-    if (!query) return events;
+    if (!query) return showPath ? events.filter(visibleEvent) : events;
     const needle = caseSensitive ? query : query.toLowerCase();
-    return events.filter(({ path }) =>
-      (caseSensitive ? path : path.toLowerCase()).includes(needle),
+    return events.filter(
+      (event) =>
+        visibleEvent(event) &&
+        (caseSensitive ? event.path : event.path.toLowerCase()).includes(needle),
     );
-  }, [isActive, eventFilterQuery, caseSensitive, bufferVersion]);
+  }, [isActive, eventFilterQuery, caseSensitive, bufferVersion, visibleEvent, showPath]);
 
   return {
     filteredEvents,

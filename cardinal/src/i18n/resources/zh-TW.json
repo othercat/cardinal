@@ -62,7 +62,11 @@
     "copyFilenames": "複製檔名",
     "copyPath": "複製路徑",
     "copyPaths": "複製路徑",
-    "resetColumnWidths": "重設欄寬"
+    "resetColumnWidths": "重設欄寬",
+    "excludeFile": "排除此檔案",
+    "excludeDirectory": "排除此檔案夾",
+    "excludePath": "排除此路徑",
+    "excludeParent": "排除上層檔案夾"
   },
   "statusBar": {
     "metadataProgress": "正在補齊大小和時間 {{done}} / {{total}} · 缺值項排在末尾",
@@ -178,8 +182,11 @@
     "action": "開始初始化"
   },
   "ignorePaths": {
-    "label": "忽略路徑",
-    "help": "每行一個路徑；這些路徑將在索引時被跳過。",
+    "label": "排除路徑",
+    "help": "每行一個檔案或檔案夾。排除檔案夾會同時排除其內容。",
+    "volumeRules": "移動卷宗排除路徑",
+    "remove": "移除",
+    "removeVolumeRule": "移除 {{path}}",
     "errors": {
       "absolute": "每個路徑需以「/」或「~」開頭。"
     }

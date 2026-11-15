@@ -27,6 +27,7 @@ import { useTranslation } from 'react-i18next';
 import { useFullDiskAccessPermission } from './hooks/useFullDiskAccessPermission';
 import type { DisplayState } from './components/StateDisplay';
 import { openResultPath } from './utils/openResultPath';
+import { absoluteRule, eventPathFilter } from './utils/pathExclusions';
 import { useStableEvent } from './hooks/useStableEvent';
 import { useAppHotkeys } from './hooks/useAppHotkeys';
 import { useAppPreferences } from './hooks/useAppPreferences';
@@ -165,12 +166,6 @@ function App() {
     queueDirectorySearch,
     onNavigateFromSearchToResults: navigateFromSearchToResults,
   });
-  const { filteredEvents } = useRecentFSEvents({
-    caseSensitive,
-    isActive: activeTab === 'events',
-    eventFilterQuery,
-  });
-
   const getQuickLookPaths = useCallback(
     () => (activeTab === 'files' ? selectedPaths : []),
     [activeTab, selectedPaths],
@@ -218,8 +213,8 @@ function App() {
   }, [focusAndSelectSearchInput]);
 
   const refreshSearchResults = useCallback(() => {
-    queueSearch(currentQuery, { immediate: true });
-  }, [currentQuery, queueSearch]);
+    if (!volume) queueSearch(searchParams.query, { immediate: true });
+  }, [volume, searchParams.query, queueSearch]);
 
   const {
     isPreferencesOpen,
@@ -234,12 +229,27 @@ function App() {
     defaultIncludePaths,
     preferencesResetToken,
     handleWatchConfigChange,
+    home,
+    excludePath,
+    volumeExclusions,
+    setVolumeExclusions,
     handleResetPreferences,
   } = useAppPreferences({
     fullDiskAccessStatus,
     isCheckingFullDiskAccess,
     refreshSearchResults,
     i18n,
+  });
+  const exclusionRoot = absoluteRule(watchRoot, home);
+  const showEventPath = useMemo(
+    () => eventPathFilter(ignorePaths, includePaths, home),
+    [ignorePaths, includePaths, home],
+  );
+  const { filteredEvents } = useRecentFSEvents({
+    caseSensitive,
+    isActive: activeTab === 'events',
+    eventFilterQuery,
+    showPath: showEventPath,
   });
 
   useAppWindowListeners({
@@ -301,22 +311,44 @@ function App() {
   const selectedIndexSet = useMemo(() => new Set(selectedIndices), [selectedIndices]);
 
   const handleRowContextMenu = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>, path: string, rowIndex: number) => {
+    (
+      event: ReactMouseEvent<HTMLDivElement>,
+      path: string,
+      rowIndex: number,
+      isDirectory?: boolean,
+    ) => {
       const isRowSelected = selectedIndexSet.has(rowIndex);
       if (!isRowSelected) {
         selectSingleRow(rowIndex);
       }
       const targetPaths = isRowSelected && selectedPaths.length > 0 ? selectedPaths : [path];
-      showFilesContextMenu(event, targetPaths);
+      showFilesContextMenu(event, targetPaths, {
+        path,
+        isDirectory,
+        root: exclusionRoot,
+        exclude: excludePath,
+      });
     },
-    [selectedIndexSet, selectedPaths, selectSingleRow, showFilesContextMenu],
+    [
+      selectedIndexSet,
+      selectedPaths,
+      selectSingleRow,
+      showFilesContextMenu,
+      exclusionRoot,
+      excludePath,
+    ],
   );
 
   const handleEventsContextMenu = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>, path: string) => {
-      showEventsContextMenu(event, [path]);
+    (event: ReactMouseEvent<HTMLDivElement>, path: string, isDirectory?: boolean) => {
+      showEventsContextMenu(event, [path], {
+        path,
+        isDirectory,
+        root: exclusionRoot,
+        exclude: excludePath,
+      });
     },
-    [showEventsContextMenu],
+    [showEventsContextMenu, exclusionRoot, excludePath],
   );
 
   const renderRow = useCallback(
@@ -478,6 +510,8 @@ function App() {
               <VolumeFiles
                 key={volume.id}
                 volume={volume}
+                exclusions={volumeExclusions}
+                onExclude={excludePath}
                 query={searchParams.query}
                 directory={directoryScopeOpen ? directoryQuery : ''}
                 caseSensitive={caseSensitive}
@@ -545,6 +579,9 @@ function App() {
         watchRoot={watchRoot ?? defaultWatchRoot}
         defaultWatchRoot={defaultWatchRoot}
         onWatchConfigChange={handleWatchConfigChange}
+        volumes={volumes}
+        volumeExclusions={volumeExclusions}
+        onVolumeExclusionsChange={setVolumeExclusions}
         ignorePaths={ignorePaths}
         defaultIgnorePaths={defaultIgnorePaths}
         includePaths={includePaths}

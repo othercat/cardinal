@@ -14,7 +14,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rayon::spawn;
 use search_cache::{
-    EventBuffer, EventReplay, InitialScan, LiveSearch, SearchCache, SearchOptions,
+    EventBuffer, EventPlan, EventReplay, InitialScan, LiveSearch, SearchCache, SearchOptions,
     SearchResultNode, SlabIndex, SortDirection, SortKey, VIEW_PAGE_SIZE, WalkData,
 };
 use search_cancel::CancellationToken;
@@ -172,7 +172,10 @@ fn handle_watch_config_update(
     fse_latency_secs: f64,
     history_ready: &mut bool,
     processed_events: &mut usize,
-) -> bool {
+    complete_baseline: bool,
+    initial_scan: &mut Option<InitialScan>,
+    restoring: &mut Vec<PathBuf>,
+) -> Option<EventPlan> {
     info!("Received watch config update: {:?}", update);
     let WatchConfigUpdate {
         watch_root: next_watch_root,
@@ -191,55 +194,78 @@ fn handle_watch_config_update(
         .collect::<Vec<_>>();
 
     *event_watcher = EventWatcher::noop();
-    update_app_state(app_handle, AppLifecycleState::Initializing);
-    reset_status_bar(app_handle);
     *history_ready = false;
-    *processed_events = 0;
-
-    let next_cache = match build_search_cache(
-        app_handle,
-        &next_watch_root,
-        &next_ignore_paths,
-        &next_include_paths,
-        scan_cancellation_token,
-    ) {
-        Some(cache) => {
-            info!(
-                "Search cache built. New root: {}, ignore paths: {:?}, include paths: {:?}",
-                next_watch_root, next_ignore_paths, next_include_paths
-            );
-            emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
-            cache
-        }
-        None => {
-            // if cache build is cancelled, we cannot reuse the old cache since
-            // it's tied to the old watch config; create a noop cache instead
-            info!("Watch config change cancelled, use noop state");
-            SearchCache::noop(
-                PathBuf::from(&next_watch_root),
-                next_ignore_paths,
-                next_include_paths,
-                &APP_QUIT,
-            )
-        }
-    };
-
-    *cache = next_cache;
-    *watch_root = next_watch_root.to_string();
-    *event_watcher = if cache.is_noop() {
-        EventWatcher::noop()
+    *initial_scan = None;
+    let mut restore_plan = None;
+    if complete_baseline && *watch_root == next_watch_root && !cache.is_noop() {
+        restore_plan = cache.update_path_rules(&next_ignore_paths, &next_include_paths, restoring);
+        emit_status_bar_update(
+            app_handle,
+            cache.get_total_files(),
+            *processed_events,
+            cache.rescan_count() as usize,
+        );
     } else {
+        restoring.clear();
+        *processed_events = 0;
+        update_app_state(app_handle, AppLifecycleState::Initializing);
+        reset_status_bar(app_handle);
+        *watch_root = next_watch_root.clone();
+        // The previous tree represents another root or an unfinished initial
+        // scan. Publish the replacement directory by directory as at startup.
+        if let Ok((fresh, scan)) = InitialScan::start(
+            PathBuf::from(&next_watch_root),
+            next_ignore_paths.clone(),
+            next_include_paths.clone(),
+            &APP_QUIT,
+            scan_cancellation_token,
+        ) {
+            *cache = fresh;
+            *initial_scan = Some(scan);
+            return None;
+        }
+        *cache = match build_search_cache(
+            app_handle,
+            &next_watch_root,
+            &next_ignore_paths,
+            &next_include_paths,
+            scan_cancellation_token,
+        ) {
+            Some(cache) => {
+                info!(
+                    "Search cache built. New root: {}, ignore paths: {:?}, include paths: {:?}",
+                    next_watch_root, next_ignore_paths, next_include_paths
+                );
+                emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
+                cache
+            }
+            None => {
+                // if cache build is cancelled, we cannot reuse the old cache since
+                // it's tied to the old watch config; create a noop cache instead
+                info!("Watch config change cancelled, use noop state");
+                SearchCache::noop(
+                    PathBuf::from(&next_watch_root),
+                    next_ignore_paths,
+                    next_include_paths,
+                    &APP_QUIT,
+                )
+            }
+        };
+    }
+    if !cache.is_noop() {
         update_app_state(app_handle, AppLifecycleState::Updating);
-        EventWatcher::spawn(
+        // An in-flight observation or a deferred r6 write may have been
+        // discarded. Replay from the last fully applied delivery.
+        *event_watcher = EventWatcher::spawn(
             watch_root.to_string(),
             cache.last_event_id(),
             fse_latency_secs,
             cache.ignore_paths(),
             cache.include_paths(),
         )
-        .1
-    };
-    !cache.is_noop()
+        .1;
+    }
+    restore_plan
 }
 
 #[derive(Serialize, Clone)]
@@ -457,6 +483,9 @@ pub fn run_background_event_loop(
     let no_events = crossbeam_channel::never();
     let no_observations = crossbeam_channel::never();
     let mut replay: Option<(EventReplay, Vec<FsEvent>)> = None;
+    // Until an expansion finishes, only the on-disk previous policy has
+    // complete coverage. Re-open its snapshot if the app quits in this window.
+    let mut restoring = Vec::new();
     let mut buffered_events = EventBuffer::default();
     let mut recent = RecentEvents::default();
     loop {
@@ -516,7 +545,7 @@ pub fn run_background_event_loop(
                     }
                     // Partial event observations retain the last complete batch's
                     // cursor, so they can be saved and replayed after restart.
-                    let _ = tx.send((complete_index && !cache.is_noop()).then_some(cache));
+                    let _ = tx.send((complete_index && restoring.is_empty() && !cache.is_noop()).then_some(cache));
                 }
                 return;
             }
@@ -536,7 +565,7 @@ pub fn run_background_event_loop(
                     &mut cache,
                     &db_path,
                     &mut hide_flush_remaining_ticks,
-                    complete_index,
+                    complete_index && restoring.is_empty(),
                 );
             }
             recv(search_rx) -> job => {
@@ -868,7 +897,7 @@ pub fn run_background_event_loop(
                 hydration_epoch += 1;
                 hydration = None;
                 info!("Manual rescan requested");
-                complete_index |= perform_rescan(
+                if perform_rescan(
                     app_handle,
                     &mut cache,
                     &mut event_watcher,
@@ -877,17 +906,20 @@ pub fn run_background_event_loop(
                     &mut history_ready,
                     &mut processed_events,
                     scan_cancellation_token,
-                );
+                ) {
+                    complete_index = true;
+                    restoring.clear();
+                }
             }
             recv(watch_config_rx) -> update => {
-                initial_scan = None;
                 replay = None;
                 buffered_events = EventBuffer::default();
                 recent.0.clear();
                 hydration_epoch += 1;
                 hydration = None;
                 let next_update = update.expect("Watch config channel closed");
-                complete_index = handle_watch_config_update(
+                *sorted_order.lock() = PublishedOrders::default();
+                let plan = handle_watch_config_update(
                     app_handle,
                     next_update,
                     &mut cache,
@@ -896,7 +928,15 @@ pub fn run_background_event_loop(
                     fse_latency_secs,
                     &mut history_ready,
                     &mut processed_events,
+                    complete_index,
+                    &mut initial_scan,
+                    &mut restoring,
                 );
+                complete_index = initial_scan.is_none() && !cache.is_noop();
+                if let Some(plan) = plan {
+                    replay = Some((plan.start(&APP_QUIT), Vec::new()));
+                }
+                let _ = app_handle.emit("watch_config_applied", ());
             }
             recv(observations) -> observation => {
                 let Ok(observation) = observation else {
@@ -906,6 +946,10 @@ pub fn run_background_event_loop(
                 };
                 if cache.apply_observation(observation) {
                     let (_, events) = replay.take().expect("active event batch");
+                    if !restoring.is_empty() {
+                        restoring.clear();
+                        let _ = app_handle.emit("watch_config_applied", ());
+                    }
                     publish_applied_events(
                         app_handle,
                         &mut cache,
@@ -914,6 +958,8 @@ pub fn run_background_event_loop(
                         processed_events,
                         &mut recent,
                     );
+                } else if !restoring.is_empty() {
+                    emit_status_bar_update(app_handle, cache.get_total_files(), processed_events, cache.rescan_count() as usize);
                 }
             }
             recv(events_rx) -> events => {

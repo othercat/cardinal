@@ -11,7 +11,12 @@ type FileRowProps = {
   item: SearchResultItem;
   rowIndex: number;
   style?: CSSProperties;
-  onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>, path: string, rowIndex: number) => void;
+  onContextMenu?: (
+    event: ReactMouseEvent<HTMLDivElement>,
+    path: string,
+    rowIndex: number,
+    isDirectory?: boolean,
+  ) => void;
   onOpen?: (path: string) => void;
   onSelect: (
     rowIndex: number,
@@ -59,7 +64,12 @@ export const FileRow = memo(function FileRow({
   const handleContextMenu = (e: ReactMouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     if (onContextMenu) {
-      onContextMenu(e, path, rowIndex);
+      onContextMenu(
+        e,
+        path,
+        rowIndex,
+        metadata && metadata.type !== 3 ? metadata.type === 1 : undefined,
+      );
     }
   };
 

@@ -25,7 +25,7 @@ vi.mock('../../utils/openResultPath', () => ({
   openResultPath: vi.fn(),
 }));
 
-mocks.menuNewMock.mockResolvedValue({ popup: mocks.popupMock });
+mocks.menuNewMock.mockResolvedValue({ popup: mocks.popupMock, close: vi.fn() });
 
 const wrapper = ({ children }: { children: ReactNode }) => (
   <I18nextProvider i18n={i18n}>{children}</I18nextProvider>
@@ -41,6 +41,27 @@ const createEvent = () =>
   > as React.MouseEvent<HTMLElement>;
 
 describe('useContextMenu', () => {
+  it('targets the clicked item and offers only its own ancestors, nearest first', async () => {
+    const exclude = vi.fn();
+    const { result } = renderHook(() => useContextMenu(), { wrapper });
+    await i18n.changeLanguage('en-US');
+    result.current.showContextMenu(createEvent(), ['/work/other', '/work/A&B/sub/note.md'], {
+      path: '/work/A&B/sub/note.md',
+      root: '/work',
+      isDirectory: false,
+      exclude,
+    });
+    const items = mocks.menuNewMock.mock.calls[0][0].items;
+    const single = items.find((i: { id: string }) => i.id === 'context_menu.exclude_item');
+    expect(single.text).toBe('Exclude This File');
+    single.action();
+    expect(exclude).toHaveBeenLastCalledWith('/work/A&B/sub/note.md');
+    const levels = items.find((i: { id: string }) => i.id === 'context_menu.exclude_parent').items;
+    expect(levels.map((i: { text: string }) => i.text)).toEqual(['/work/A&&B/sub', '/work/A&&B']);
+    levels[1].action();
+    expect(exclude).toHaveBeenLastCalledWith('/work/A&B');
+  });
+
   beforeEach(async () => {
     mocks.menuNewMock.mockClear();
     mocks.popupMock.mockClear();
