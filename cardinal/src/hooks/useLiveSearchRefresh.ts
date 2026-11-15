@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { subscribeFSEventsBatch } from '../runtime/tauriEventRuntime';
+import { subscribeIndexedEvents } from '../runtime/tauriEventRuntime';
 import { useStableEvent } from './useStableEvent';
 import type { FileChangeBatch, RecentEventPayload } from '../types/ipc';
 
@@ -78,7 +78,7 @@ export function useLiveSearchRefresh(
       dirty = true;
       schedule();
     };
-    const unlisten = subscribeFSEventsBatch((events) => {
+    const unlisten = subscribeIndexedEvents((events) => {
       if (events.length === 0) return;
       dirty = true;
       collect(events);

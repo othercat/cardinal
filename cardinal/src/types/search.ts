@@ -12,6 +12,7 @@ export type SearchResultItem = Readonly<{
   mtime?: number;
   ctime?: number;
   icon?: string;
+  thumbnail?: boolean;
 }>;
 
 export type NodeInfoResponse = Readonly<{

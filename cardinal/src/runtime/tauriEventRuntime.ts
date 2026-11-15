@@ -29,6 +29,7 @@ const statusBarUpdateListeners = new Set<Listener<StatusBarUpdatePayload>>();
 const lifecycleStateListeners = new Set<Listener<AppLifecycleStatus>>();
 const quickLaunchListeners = new Set<Listener<void>>();
 const fsEventsBatchListeners = new Set<Listener<RecentEventPayload[]>>();
+const indexedEventsListeners = new Set<Listener<RecentEventPayload[]>>();
 const iconUpdateListeners = new Set<Listener<readonly IconUpdatePayload[]>>();
 const quickLookKeydownListeners = new Set<Listener<QuickLookKeydownPayload>>();
 const windowDragDropListeners = new Set<Listener<WindowDragDropEvent>>();
@@ -88,6 +89,7 @@ const normalizeIconUpdates = (payload: unknown): IconUpdatePayload[] => {
   return payload.filter(isIconUpdateWirePayload).map((item) => ({
     slabIndex: item.slabIndex as SlabIndex,
     icon: item.icon,
+    thumbnail: item.thumbnail,
     ...(typeof item.path === 'string' ? { path: item.path } : {}),
   }));
 };
@@ -118,11 +120,18 @@ export const initializeTauriEventRuntime = (): Promise<void> => {
       }).catch((error) => {
         console.error('Failed to register quick_launch listener', error);
       }),
-      listen<RecentEventPayload[]>('fs_events_batch', (event) => {
-        const payload = normalizeRecentEvents(event.payload);
-        if (payload.length === 0) return;
-        emit(fsEventsBatchListeners, payload);
-      }).catch((error) => {
+      listen<{ recent: RecentEventPayload[]; indexed?: RecentEventPayload[] }>(
+        'fs_events_batch',
+        (event) => {
+          const recent = normalizeRecentEvents(event.payload?.recent);
+          const indexed =
+            event.payload?.indexed === undefined
+              ? recent
+              : normalizeRecentEvents(event.payload.indexed);
+          if (recent.length) emit(fsEventsBatchListeners, recent);
+          if (indexed.length) emit(indexedEventsListeners, indexed);
+        },
+      ).catch((error) => {
         console.error('Failed to register fs_events_batch listener', error);
       }),
       listen<readonly IconUpdateWirePayload[] | null | undefined>('icon_update', (event) => {
@@ -174,6 +183,11 @@ export const subscribeQuickLaunch = (listener: () => void): UnlistenFn => {
 export const subscribeFSEventsBatch = (listener: Listener<RecentEventPayload[]>): UnlistenFn => {
   void initializeTauriEventRuntime();
   return subscribe(fsEventsBatchListeners, listener);
+};
+
+export const subscribeIndexedEvents = (listener: Listener<RecentEventPayload[]>): UnlistenFn => {
+  void initializeTauriEventRuntime();
+  return subscribe(indexedEventsListeners, listener);
 };
 
 export const subscribeIconUpdate = (

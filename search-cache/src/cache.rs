@@ -13,7 +13,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use cardinal_sdk::{EventFlag, FsEvent, ScanType, current_event_id};
 use cardinal_syntax::{Expr, Filter, FilterKind, Term, optimize_query, parse_query};
-pub use event_replay::{EventObservation, EventPlan, EventReplay};
+pub use event_replay::{EventBuffer, EventObservation, EventPlan, EventReplay};
 use fswalk::{Node, NodeMetadata, WalkData, should_ignore_path, walk_it};
 use hashbrown::HashSet;
 use namepool::NamePool;
@@ -629,6 +629,20 @@ impl SearchCache {
         };
         let mut current = self.file_nodes.root();
         for segment in path {
+            // Wide folders are common in caches. The existing name index can
+            // locate a rare basename without visiting every sibling per write.
+            let children = &self.file_nodes[current].children;
+            if !case_insensitive
+                && children.len() >= 64
+                && let Some(named) = segment.to_str().and_then(|n| self.name_index.get(n))
+                && named.len() < children.len()
+            {
+                current = named
+                    .iter()
+                    .copied()
+                    .find(|&id| self.file_nodes[id].parent() == Some(current))?;
+                continue;
+            }
             let next = self.file_nodes[current]
                 .children
                 .iter()

@@ -63,4 +63,24 @@ describe('useRecentFSEvents', () => {
 
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps the last 10,000 raw notifications in order while the Files tab is open', () => {
+    const { result, rerender } = renderHook(
+      ({ active }) =>
+        useRecentFSEvents({ isActive: active, caseSensitive: false, eventFilterQuery: '' }),
+      { initialProps: { active: false } },
+    );
+    const rows = Array.from({ length: 10_019 }, (_, eventId) => ({
+      path: '/scratch/hot.tmp',
+      eventId,
+      timestamp: 1,
+      flagBits: 4096,
+    }));
+    act(() => fsEventsBatchListener?.(rows));
+    expect(result.current.filteredEvents).toHaveLength(0);
+    rerender({ active: true });
+    expect(result.current.filteredEvents.map((e) => e.eventId)).toEqual(
+      rows.slice(19).map((e) => e.eventId),
+    );
+  });
 });

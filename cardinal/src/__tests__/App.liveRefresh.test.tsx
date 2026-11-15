@@ -15,7 +15,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('../runtime/tauriEventRuntime', () => ({
-  subscribeFSEventsBatch: (callback: typeof events.emit) => {
+  subscribeIndexedEvents: (callback: typeof events.emit) => {
     events.emit = callback;
     return () => {};
   },

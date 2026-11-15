@@ -1,14 +1,14 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { subscribeFSEventsBatch } from '../../runtime/tauriEventRuntime';
+import { subscribeIndexedEvents } from '../../runtime/tauriEventRuntime';
 import { LIVE_SEARCH_REFRESH_MS, useLiveSearchRefresh } from '../useLiveSearchRefresh';
 
-vi.mock('../../runtime/tauriEventRuntime', () => ({ subscribeFSEventsBatch: vi.fn() }));
-const subscribe = vi.mocked(subscribeFSEventsBatch);
+vi.mock('../../runtime/tauriEventRuntime', () => ({ subscribeIndexedEvents: vi.fn() }));
+const subscribe = vi.mocked(subscribeIndexedEvents);
 const event = { path: '/changing.txt', flagBits: 4096, eventId: 1, timestamp: 0 };
 
 describe('useLiveSearchRefresh', () => {
-  let emit: Parameters<typeof subscribeFSEventsBatch>[0];
+  let emit: Parameters<typeof subscribeIndexedEvents>[0];
   const unlisten = vi.fn();
   beforeEach(() => {
     vi.useFakeTimers();

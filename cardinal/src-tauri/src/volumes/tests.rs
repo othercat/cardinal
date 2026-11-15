@@ -117,6 +117,8 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
     a.attach(&mount);
     fs::write(mount.join("needle-small.txt"), b"12").unwrap();
     fs::write(mount.join("needle-large.txt"), [1u8; 2048]).unwrap();
+    let hot_file = mount.join("hot-metadata.tmp");
+    fs::write(&hot_file, [0]).unwrap();
     let dir = mount.join("Nested");
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("needle-delete.txt"), b"12345").unwrap();
@@ -164,6 +166,10 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
             && rows(&src, "needle-delete", None).is_empty()
             && rows(&src, "needle-renamed", None).len() == 1
     });
+    for size in [17, 159, 997] {
+        fs::write(&hot_file, vec![0; size]).unwrap();
+    }
+    wait(|| rows(&src, "hot-metadata", None)[0]["metadata"]["size"] == 997);
     let t = Instant::now();
     a.detach();
     store.reconcile(&cache_dir, fixture_mounts(&label), &notify);
@@ -177,6 +183,7 @@ fn mounted_disk_images_search_updates_and_offline_restart() {
     let store = Volumes::default();
     store.restore(&cache_dir).unwrap();
     let src = store.get(&first.id).unwrap();
+    assert_eq!(rows(&src, "hot-metadata", None)[0]["metadata"]["size"], 997);
     let t = Instant::now();
     let saved = rows(&src, "needle", sort(search_cache::SortDirection::Desc));
     assert_eq!(saved.len(), 3);

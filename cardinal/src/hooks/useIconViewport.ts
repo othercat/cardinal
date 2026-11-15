@@ -1,98 +1,87 @@
-import type { ResultPages } from '../utils/resultPages';
-import { useCallback, useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { FileChangeBatch } from '../types/ipc';
+import type { SearchResultItem } from '../types/search';
 import type { SlabIndex } from '../types/slab';
+import { FLAG_BITS } from '../utils/eventFlags';
+import type { ResultPages } from '../utils/resultPages';
 
-type UseIconViewportProps = {
+type Viewport = {
   results: SlabIndex[];
   pages?: ResultPages;
-  resultsVersion: number;
+  rows: ReadonlyMap<SlabIndex, SearchResultItem>;
+  queryVersion: number;
+  dataVersion: number;
+  pageVersion: number;
+  fileChanges: FileChangeBatch;
   start: number;
   end: number;
 };
 
-// Deduplicates and throttles icon viewport updates to the backend.
+const appearanceFlags =
+  FLAG_BITS.ITEM_CREATED |
+  FLAG_BITS.ITEM_REMOVED |
+  FLAG_BITS.ITEM_RENAMED |
+  FLAG_BITS.ITEM_CLONED |
+  FLAG_BITS.ITEM_XATTR_MOD |
+  FLAG_BITS.ITEM_FINDER_INFO_MOD;
+const imageName =
+  /\.(?:avif|bmp|dng|gif|heic|heif|ico|jpe?g|png|psd|svg|tiff?|webp|arw|cr[23]|nef|orf|raf|raw)$/i;
+
 export function useIconViewport({
   results,
   pages,
-  resultsVersion,
+  rows,
+  queryVersion,
+  dataVersion,
+  pageVersion,
+  fileChanges,
   start,
   end,
-}: UseIconViewportProps) {
-  const requestIdRef = useRef(0);
-  const lastRangeRef = useRef<{ start: number; end: number } | null>(null);
-  const pendingRef = useRef<SlabIndex[] | null>(null);
-  const rafRef = useRef<number | null>(null);
+}: Viewport) {
+  const visible = useRef(new Map<SlabIndex, SearchResultItem>());
+  const lastQuery = useRef(-1);
+  const lastData = useRef(-1);
+  const requestId = useRef(0);
 
-  const flushIconViewport = useCallback(() => {
-    rafRef.current = null;
-    const viewport = pendingRef.current;
-    if (!viewport) return;
-    pendingRef.current = null;
-    requestIdRef.current += 1;
-    void invoke('update_icon_viewport', { id: requestIdRef.current, viewport });
-  }, []);
-
-  const scheduleIconViewport = useCallback(
-    (viewport: SlabIndex[]) => {
-      pendingRef.current = viewport;
-      if (rafRef.current === null) {
-        rafRef.current = requestAnimationFrame(flushIconViewport);
+  useEffect(() => {
+    if (lastQuery.current !== queryVersion) visible.current.clear();
+    lastQuery.current = queryVersion;
+    const changes = new Map<string, number>();
+    if (lastData.current !== dataVersion) {
+      for (const { path, flagBits } of fileChanges ?? []) {
+        changes.set(path, (changes.get(path) ?? 0) | flagBits);
       }
-    },
-    [flushIconViewport],
-  );
+    }
+    lastData.current = dataVersion;
 
-  useEffect(() => {
-    // Reset tracking when the source list identity changes.
-    lastRangeRef.current = null;
-  }, [resultsVersion]);
-
-  useEffect(() => {
+    const next = new Map<SlabIndex, SearchResultItem>();
+    const needed: SlabIndex[] = [];
     const length = pages?.length ?? results.length;
-    const clampedStart = Math.max(0, start);
-    const clampedEnd = Math.min(end, length - 1);
-    const hasRange = length > 0 && end >= start && clampedEnd >= clampedStart;
-
-    // Nothing to send; emit a clear once per empty state.
-    if (!hasRange) {
-      if (!lastRangeRef.current || lastRangeRef.current.start !== -1) {
-        lastRangeRef.current = { start: -1, end: -1 };
-        scheduleIconViewport([]);
+    for (let i = Math.max(0, start); i <= end && i < length; i++) {
+      const id = pages ? pages.idAt(i) : results[i];
+      if (id === undefined) continue;
+      const row = rows.get(id);
+      if (!row) continue;
+      next.set(id, row);
+      const previous = visible.current.get(id);
+      const flags = changes.get(row.path) ?? 0;
+      const preview = row.thumbnail || imageName.test(row.path);
+      if (
+        previous?.path !== row.path ||
+        previous.metadata?.type !== row.metadata?.type ||
+        (flags & appearanceFlags) !== 0 ||
+        (preview &&
+          (changes.has(row.path) || previous.size !== row.size || previous.mtime !== row.mtime))
+      ) {
+        needed.push(id);
       }
-      return;
     }
-
-    const last = lastRangeRef.current;
-    if (last && last.start === clampedStart && last.end === clampedEnd) {
-      return; // viewport unchanged; skip IPC
+    visible.current = next;
+    if (needed.length) {
+      void invoke('update_icon_viewport', { id: ++requestId.current, viewport: needed }).catch(
+        console.error,
+      );
     }
-
-    lastRangeRef.current = { start: clampedStart, end: clampedEnd };
-    if (!pages) {
-      scheduleIconViewport(results.slice(clampedStart, clampedEnd + 1));
-      return;
-    }
-    let stale = false;
-    void pages
-      .range(clampedStart, clampedEnd + 1)
-      .then((ids) => {
-        if (!stale) scheduleIconViewport(ids);
-      })
-      .catch(() => {});
-    return () => {
-      stale = true;
-    };
-  }, [results, pages, resultsVersion, start, end, scheduleIconViewport]);
-
-  useEffect(
-    () => () => {
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-      }
-      pendingRef.current = [];
-      flushIconViewport();
-    },
-    [flushIconViewport],
-  );
+  }, [results, pages, rows, queryVersion, dataVersion, pageVersion, fileChanges, start, end]);
 }

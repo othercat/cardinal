@@ -14,12 +14,13 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rayon::spawn;
 use search_cache::{
-    EventReplay, InitialScan, LiveSearch, SearchCache, SearchOptions, SearchResultNode, SlabIndex,
-    SortDirection, SortKey, VIEW_PAGE_SIZE, WalkData,
+    EventBuffer, EventReplay, InitialScan, LiveSearch, SearchCache, SearchOptions,
+    SearchResultNode, SlabIndex, SortDirection, SortKey, VIEW_PAGE_SIZE, WalkData,
 };
 use search_cancel::CancellationToken;
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -46,6 +47,7 @@ pub struct IconPayload {
     pub path: String,
     pub slab_index: SlabIndex,
     pub icon: String,
+    pub thumbnail: bool,
 }
 
 pub struct BackgroundLoopChannels {
@@ -240,13 +242,6 @@ fn handle_watch_config_update(
     !cache.is_noop()
 }
 
-struct EventSnapshot {
-    path: PathBuf,
-    event_id: u64,
-    flag: EventFlag,
-    timestamp: i64,
-}
-
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RecentEvent {
@@ -254,6 +249,46 @@ struct RecentEvent {
     flag_bits: u32,
     event_id: u64,
     timestamp: i64,
+}
+
+impl RecentEvent {
+    fn from_event(event: &FsEvent, timestamp: i64) -> Self {
+        Self {
+            path: event.path.to_string_lossy().into_owned(),
+            flag_bits: event.flag.bits(),
+            event_id: event.id,
+            timestamp,
+        }
+    }
+}
+
+// The Events tab keeps the last 10,000 actual notifications in receipt order,
+// independently of when the Files tab sees their reconciled metadata.
+#[derive(Default)]
+struct RecentEvents(VecDeque<RecentEvent>);
+
+impl RecentEvents {
+    fn record(&mut self, incoming: &[FsEvent], mut live: bool) {
+        let timestamp = unix_timestamp_now();
+        for event in incoming {
+            if event.flag.contains(EventFlag::HistoryDone) {
+                live = true;
+            } else if live {
+                if self.0.len() == 10_000 {
+                    self.0.pop_front();
+                }
+                self.0.push_back(RecentEvent::from_event(event, timestamp));
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct EventUpdate<'a> {
+    recent: &'a VecDeque<RecentEvent>,
+    // Normally the same events feed both views, so serialize them only once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed: Option<Vec<RecentEvent>>,
 }
 
 fn handle_flush_tick(
@@ -283,34 +318,49 @@ fn publish_applied_events(
     cache: &mut SearchCache,
     events: Vec<FsEvent>,
     history_ready: &mut bool,
-    processed_events: &mut usize,
+    processed_events: usize,
+    recent: &mut RecentEvents,
 ) {
-    *processed_events += events.len();
-
-    let mut snapshots = Vec::with_capacity(events.len());
-    for event in events.iter() {
-        if event.flag.contains(EventFlag::HistoryDone) {
-            *history_ready = true;
-        } else if *history_ready {
-            snapshots.push(EventSnapshot {
-                path: event.path.clone(),
-                event_id: event.id,
-                flag: event.flag,
-                timestamp: unix_timestamp_now(),
-            });
-        }
-    }
-
+    let indexed = if *history_ready {
+        &events[..]
+    } else if let Some(pos) = events
+        .iter()
+        .position(|e| e.flag.contains(EventFlag::HistoryDone))
+    {
+        *history_ready = true;
+        &events[pos + 1..]
+    } else {
+        &[]
+    };
     emit_status_bar_update(
         app_handle,
         cache.get_total_files(),
-        *processed_events,
+        processed_events,
         cache.rescan_count() as usize,
     );
     if *history_ready {
         update_app_state(app_handle, AppLifecycleState::Ready);
-        if !snapshots.is_empty() {
-            forward_new_events(app_handle, &snapshots);
+        if !indexed.is_empty() || !recent.0.is_empty() {
+            let same = indexed.len() == recent.0.len()
+                && indexed.iter().zip(&recent.0).all(|(e, r)| {
+                    e.id == r.event_id
+                        && e.flag.bits() == r.flag_bits
+                        && e.path.as_os_str() == r.path.as_str()
+                });
+            let timestamp = unix_timestamp_now();
+            let _ = app_handle.emit(
+                "fs_events_batch",
+                EventUpdate {
+                    recent: &recent.0,
+                    indexed: (!same).then(|| {
+                        indexed
+                            .iter()
+                            .map(|e| RecentEvent::from_event(e, timestamp))
+                            .collect()
+                    }),
+                },
+            );
+            recent.0.clear();
         }
     }
 }
@@ -322,7 +372,7 @@ fn handle_icon_viewport_update(
 ) {
     let (_request_id, viewport) = update;
 
-    let nodes = cache.expand_file_nodes(&viewport);
+    let nodes = cache.cached_file_nodes(&viewport);
     let icon_jobs: Vec<_> = viewport
         .into_iter()
         .zip(nodes)
@@ -342,11 +392,9 @@ fn handle_icon_viewport_update(
                 let cloud = ["OneDrive", "com~apple~CloudDocs", "Google Drive", "Dropbox"]
                     .iter()
                     .any(|marker| path.contains(marker));
-                let data = if cloud {
-                    fs_icon::icon_of_path_ns(&path)
-                } else {
-                    fs_icon::icon_of_path(&path)
-                };
+                let preview = (!cloud).then(|| fs_icon::icon_of_path_ql(&path)).flatten();
+                let thumbnail = preview.is_some();
+                let data = preview.or_else(|| fs_icon::icon_of_path_ns(&path));
                 if let Some(icon) = data.map(|data| {
                     format!(
                         "data:image/png;base64,{}",
@@ -357,6 +405,7 @@ fn handle_icon_viewport_update(
                         slab_index,
                         path,
                         icon,
+                        thumbnail,
                     });
                 }
             });
@@ -408,6 +457,8 @@ pub fn run_background_event_loop(
     let no_events = crossbeam_channel::never();
     let no_observations = crossbeam_channel::never();
     let mut replay: Option<(EventReplay, Vec<FsEvent>)> = None;
+    let mut buffered_events = EventBuffer::default();
+    let mut recent = RecentEvents::default();
     loop {
         complete_index |= load_app_state() == AppLifecycleState::Ready;
         if APP_QUIT.load(Ordering::Relaxed) && !complete_index {
@@ -426,6 +477,11 @@ pub fn run_background_event_loop(
             .as_ref()
             .map(|(r, _)| r.observations())
             .unwrap_or(&no_observations);
+        let deadline = buffered_events
+            .deadline()
+            .filter(|_| replay.is_none())
+            .map(crossbeam_channel::at);
+        let mut incoming = None;
         crossbeam_channel::select! {
             recv(scan_rx) -> batch => {
                 let scan = initial_scan.as_mut().expect("active scan");
@@ -452,6 +508,12 @@ pub fn run_background_event_loop(
             }
             recv(finish_rx) -> tx => {
                 if let Ok(tx) = tx {
+                    // A busy replay keeps its last complete cursor for next launch.
+                    if replay.is_none() && let Some(due) = buffered_events.deadline()
+                        && let Ok(Some((plan, _))) = buffered_events.prepare(&mut cache, vec![], due)
+                    {
+                        plan.read(|| false, |change| { cache.apply_observation(change); });
+                    }
                     // Partial event observations retain the last complete batch's
                     // cursor, so they can be saved and replayed after restart.
                     let _ = tx.send((complete_index && !cache.is_noop()).then_some(cache));
@@ -796,8 +858,13 @@ pub fn run_background_event_loop(
             }
             recv(rescan_rx) -> request => {
                 let scan_cancellation_token = request.expect("Rescan channel closed");
+                if scan_cancellation_token.is_cancelled().is_none() {
+                    continue;
+                }
                 initial_scan = None;
                 replay = None;
+                buffered_events = EventBuffer::default();
+                recent.0.clear();
                 hydration_epoch += 1;
                 hydration = None;
                 info!("Manual rescan requested");
@@ -815,6 +882,8 @@ pub fn run_background_event_loop(
             recv(watch_config_rx) -> update => {
                 initial_scan = None;
                 replay = None;
+                buffered_events = EventBuffer::default();
+                recent.0.clear();
                 hydration_epoch += 1;
                 hydration = None;
                 let next_update = update.expect("Watch config channel closed");
@@ -842,28 +911,48 @@ pub fn run_background_event_loop(
                         &mut cache,
                         events,
                         &mut history_ready,
-                        &mut processed_events,
+                        processed_events,
+                        &mut recent,
                     );
                 }
             }
             recv(events_rx) -> events => {
-                let events = events.expect("Event stream closed");
-                match cache.plan_events(&events) {
-                    Ok(plan) => replay = Some((plan.start(&APP_QUIT), events)),
-                    Err(_) => {
-                        hydration_epoch += 1;
-                        hydration = None;
-                        complete_index |= perform_rescan(
-                            app_handle,
-                            &mut cache,
-                            &mut event_watcher,
-                            &watch_root,
-                            fse_latency_secs,
-                            &mut history_ready,
-                            &mut processed_events,
-                            CancellationToken::new_scan(),
-                        );
-                    }
+                let mut events = events.expect("Event stream closed");
+                for more in event_watcher.try_iter().take(7) {
+                    events.extend(more);
+                }
+                incoming = Some(events);
+            }
+            recv(deadline.as_ref().unwrap_or(&no_plan)) -> _ => {
+                incoming = Some(vec![]);
+            }
+        }
+        if let Some(events) = incoming {
+            processed_events += events.len();
+            recent.record(&events, history_ready);
+            let work = if history_ready {
+                buffered_events.prepare(&mut cache, events, Instant::now())
+            } else {
+                cache.plan_events(&events).map(|plan| Some((plan, events)))
+            };
+            match work {
+                Ok(Some((plan, events))) => replay = Some((plan.start(&APP_QUIT), events)),
+                Ok(None) => {}
+                Err(_) => {
+                    buffered_events = EventBuffer::default();
+                    recent.0.clear();
+                    hydration_epoch += 1;
+                    hydration = None;
+                    complete_index |= perform_rescan(
+                        app_handle,
+                        &mut cache,
+                        &mut event_watcher,
+                        &watch_root,
+                        fse_latency_secs,
+                        &mut history_ready,
+                        &mut processed_events,
+                        CancellationToken::new_scan(),
+                    );
                 }
             }
         }
@@ -995,30 +1084,6 @@ fn unix_timestamp_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn forward_new_events(app_handle: &AppHandle, snapshots: &[EventSnapshot]) {
-    if snapshots.is_empty() {
-        return;
-    }
-
-    let mut ordered_events: Vec<&EventSnapshot> = snapshots.iter().collect();
-    ordered_events.sort_unstable_by(|a, b| {
-        a.timestamp
-            .cmp(&b.timestamp)
-            .then_with(|| a.event_id.cmp(&b.event_id))
-    });
-    let new_events: Vec<RecentEvent> = ordered_events
-        .into_iter()
-        .map(|event| RecentEvent {
-            path: event.path.to_string_lossy().into_owned(),
-            flag_bits: event.flag.bits(),
-            event_id: event.event_id,
-            timestamp: event.timestamp,
-        })
-        .collect();
-
-    let _ = app_handle.emit("fs_events_batch", new_events);
 }
 
 struct FlushSearchCache<'cache> {
