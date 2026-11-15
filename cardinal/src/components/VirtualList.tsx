@@ -101,7 +101,17 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
     rowCount && viewportHeight
       ? Math.min(rowCount - 1, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan - 1)
       : -1;
-  useIconViewport({ results, pages, resultsVersion: displayedResultsVersion, start, end });
+  useIconViewport({
+    results,
+    pages,
+    rows: cache,
+    queryVersion,
+    dataVersion: dataResultsVersion,
+    pageVersion,
+    fileChanges,
+    start,
+    end,
+  });
 
   // Clamp scroll updates so callers cannot push the viewport outside legal bounds
   const updateScrollAndRange = useCallback(

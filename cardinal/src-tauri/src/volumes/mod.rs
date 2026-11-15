@@ -13,7 +13,7 @@ use fswalk::{WalkData, walk_it_without_root_chain};
 use mounts::{Mount, discover, uuid};
 use parking_lot::Mutex;
 use query::Index;
-use search_cache::{EventObservation, SearchCache, read_snapshot_header};
+use search_cache::{EventBuffer, EventObservation, SearchCache, read_snapshot_header};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -531,9 +531,12 @@ fn watch(
     notify();
 
     let mut last_checkpoint = Instant::now();
-    loop {
+    let mut buffered = EventBuffer::default();
+    // Ejection can deliver a root-rescan flag or end the event stream before
+    // the mount notification. Every exit must save already reconciled changes.
+    let outcome = loop {
         if stopped() {
-            break;
+            break Ok(false);
         }
         // Some third-party drivers have no notification stream. A read-only
         // mount needs no polling. Writable media gets a background reconciliation.
@@ -541,90 +544,116 @@ fn watch(
             && !mount.read_only
             && last_checkpoint.elapsed() >= Duration::from_secs(60)
         {
-            return Ok(true);
+            break Ok(true);
         }
-        match events.recv_timeout(Duration::from_millis(250)) {
-            Ok(batch) => {
-                tracing::trace!("Volume event batch: {batch:?}");
-                let mut batch: Vec<_> = batch
-                    .into_iter()
-                    .chain(events.try_iter().take(31).flatten())
-                    .filter(|e| {
-                        if e.flag.contains(EventFlag::HistoryDone)
-                            || (e.path == mount.path && e.flag == EventFlag::Mount)
-                        {
-                            return false;
-                        }
-                        let relative = e.path.strip_prefix(&mount.path).unwrap_or(&e.path);
-                        !relative
-                            .iter()
-                            .next()
-                            .is_some_and(|c| OMIT.iter().any(|n| c == OsStr::new(n)))
-                    })
-                    .collect();
-                if batch.is_empty() {
-                    continue;
-                }
-                if !mount.present() || stopped() {
-                    break;
-                }
-                // Never save host stream event IDs as device journal cursors.
-                if live_only {
-                    for e in &mut batch {
-                        e.id = 0;
+        let now = Instant::now();
+        let timeout = Duration::from_millis(250);
+        let timeout = buffered.deadline().map_or(timeout, |due| {
+            timeout.min(due.saturating_duration_since(now))
+        });
+        let mut batch: Vec<_> = match events.recv_timeout(timeout) {
+            Ok(batch) => batch
+                .into_iter()
+                .chain(events.try_iter().take(31).flatten())
+                .filter(|e| {
+                    if e.flag.contains(EventFlag::HistoryDone)
+                        || (e.path == mount.path && e.flag == EventFlag::Mount)
+                    {
+                        return false;
                     }
-                }
-                let plan = {
-                    let mut data = source.index.lock();
-                    let index = data.as_mut().context("Volume index unavailable")?;
-                    match index.cache.plan_events(&batch) {
-                        Ok(p) => p,
-                        Err(_) => return Ok(true),
-                    }
-                };
-                // Reconcile off the UI lock, and commit the batch only while this volume still owns the mount.
-                let mut changes = Vec::new();
-                plan.read(stopped, |c| changes.push(c));
-                if stopped() || !mount.present() {
-                    break;
-                }
-                let visible = changes
-                    .iter()
-                    .any(|c| !matches!(c, EventObservation::Done(_)));
-                {
-                    let mut data = source.index.lock();
-                    if stopped() {
-                        break;
-                    }
-                    let index = data.as_mut().context("Volume index unavailable")?;
-                    for change in changes {
-                        index.cache.apply_observation(change);
-                    }
-                    dirty = true;
-                    if visible {
-                        index.changed();
-                        let mut meta = source.meta.lock();
-                        meta.info.count = Some(index.cache.get_total_files());
-                        meta.info.revision += 1;
-                    }
-                }
-                if visible {
-                    notify();
+                    let relative = e.path.strip_prefix(&mount.path).unwrap_or(&e.path);
+                    !relative
+                        .iter()
+                        .next()
+                        .is_some_and(|c| OMIT.iter().any(|n| c == OsStr::new(n)))
+                })
+                .collect(),
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(anyhow::anyhow!("Volume event stream ended"));
+            }
+            Err(RecvTimeoutError::Timeout) => vec![],
+        };
+        let now = Instant::now();
+        if !batch.is_empty() || buffered.deadline().is_some_and(|due| now >= due) {
+            // Never save host stream event IDs as device journal cursors.
+            if live_only {
+                for e in &mut batch {
+                    e.id = 0;
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => anyhow::bail!("Volume event stream ended"),
-            Err(RecvTimeoutError::Timeout) => {}
+            let plan = {
+                let mut data = source.index.lock();
+                let index = data.as_mut().context("Volume index unavailable")?;
+                match buffered.prepare(&mut index.cache, batch, now) {
+                    Ok(Some((plan, _))) => plan,
+                    Ok(None) => continue,
+                    Err(_) => break Ok(!stopped() && mount.present()),
+                }
+            };
+            if !mount.present() || stopped() {
+                break Ok(false);
+            }
+            // Reconcile off the UI lock, and commit the batch only while this volume still owns the mount.
+            let mut changes = Vec::new();
+            plan.read(stopped, |c| changes.push(c));
+            if stopped() || !mount.present() {
+                break Ok(false);
+            }
+            let visible = changes
+                .iter()
+                .any(|c| !matches!(c, EventObservation::Done(_)));
+            {
+                let mut data = source.index.lock();
+                if stopped() {
+                    break Ok(false);
+                }
+                let index = data.as_mut().context("Volume index unavailable")?;
+                for change in changes {
+                    index.cache.apply_observation(change);
+                }
+                dirty = true;
+                if visible {
+                    index.changed();
+                    let mut meta = source.meta.lock();
+                    meta.info.count = Some(index.cache.get_total_files());
+                    meta.info.revision += 1;
+                }
+            }
+            if visible {
+                notify();
+            }
         }
-        if dirty && last_checkpoint.elapsed() >= Duration::from_secs(10) {
+        // Writing a full volume snapshot compresses the entire index. Save on
+        // detach/quit as well, so a sustained stream does not force one every 10s.
+        if dirty && last_checkpoint.elapsed() >= Duration::from_secs(300) {
             let mut data = source.index.lock();
             if stopped() {
-                break;
+                break Ok(false);
             }
             if let Some(index) = data.as_mut() {
                 checkpoint(source, index, &db)?;
             }
             last_checkpoint = Instant::now();
             dirty = false;
+        }
+    };
+    if let Some(due) = buffered.deadline()
+        && APP_QUIT.load(Ordering::Relaxed)
+        && source.current(generation)
+        && mount.verified_path(&mount.path)
+    {
+        let mut data = source.index.lock();
+        if let Some(index) = data.as_mut()
+            && let Ok(Some((plan, _))) = buffered.prepare(&mut index.cache, vec![], due)
+        {
+            let mut changes = Vec::new();
+            plan.read(|| !source.current(generation), |c| changes.push(c));
+            if source.current(generation) && mount.verified_path(&mount.path) {
+                for change in changes {
+                    index.cache.apply_observation(change);
+                }
+                dirty = true;
+            }
         }
     }
     // A later attachment has its own worker. Never overwrite its generation.
@@ -638,5 +667,5 @@ fn watch(
             checkpoint(source, index, &db)?;
         }
     }
-    Ok(false)
+    outcome
 }

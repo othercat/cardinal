@@ -2,7 +2,91 @@
 //! outside the index writer. Each message can be applied between UI requests.
 use super::*;
 use fswalk::{DirectoryMetadataEntry, NodeFileType, read_directory_metadata};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+const SMALL_FILE_BYTES: i64 = 4096;
+const SMALL_FILE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_DEFERRED_PATHS: usize = 4096;
+
+/// Per event stream. Keep the durable cursor behind any work still only in memory.
+#[derive(Default)]
+pub struct EventBuffer {
+    pending: HashMap<PathBuf, (EventFlag, u64)>,
+    deadline: Option<Instant>,
+    received_through: Option<u64>,
+}
+
+impl EventBuffer {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn prepare(
+        &mut self,
+        cache: &mut SearchCache,
+        incoming: Vec<FsEvent>,
+        now: Instant,
+    ) -> Result<Option<(EventPlan, Vec<FsEvent>)>, HandleFSEError> {
+        let mut ready = Vec::new();
+        let mut flush = self.deadline.is_some_and(|deadline| now >= deadline);
+        for mut event in incoming {
+            self.received_through = self.received_through.max(Some(event.id));
+            if event.flag.contains(EventFlag::HistoryDone) {
+                flush = true;
+            }
+            if can_delay_write(event.flag) {
+                if let Some((flags, id)) = self.pending.get_mut(&event.path) {
+                    *flags |= event.flag;
+                    *id = (*id).max(event.id);
+                    continue;
+                }
+                if self.pending.len() < MAX_DEFERRED_PATHS
+                    && cache.is_small_uncommon_file(&event.path)
+                {
+                    self.deadline.get_or_insert(now + SMALL_FILE_INTERVAL);
+                    self.pending.insert(event.path, (event.flag, event.id));
+                    flush |= self.pending.len() == MAX_DEFERRED_PATHS;
+                    continue;
+                }
+            }
+            // A rename/removal of a queued path must be visible immediately.
+            if let Some((flags, _)) = self.pending.remove(&event.path) {
+                event.flag |= flags;
+            }
+            ready.push(event);
+        }
+        if flush {
+            ready.extend(
+                self.pending
+                    .drain()
+                    .map(|(path, (flag, id))| FsEvent { path, flag, id }),
+            );
+        }
+        let checkpoint = if self.pending.is_empty() {
+            self.deadline = None;
+            self.received_through.take()
+        } else {
+            None
+        };
+        if ready.is_empty() {
+            return Ok(None);
+        }
+        let mut plan = cache.plan_events(&ready)?;
+        plan.last_event = checkpoint;
+        Ok(Some((plan, ready)))
+    }
+}
+
+fn can_delay_write(flag: EventFlag) -> bool {
+    let writes = EventFlag::ItemModified
+        | EventFlag::ItemInodeMetaMod
+        | EventFlag::ItemXattrMod
+        | EventFlag::ItemChangeOwner
+        | EventFlag::ItemFinderInfoMod;
+    flag.contains(EventFlag::ItemIsFile)
+        && flag.intersects(writes)
+        && (flag - (writes | EventFlag::ItemIsFile | EventFlag::OwnEvent)).is_empty()
+}
 
 pub struct EventPlan {
     paths: Vec<(PathBuf, bool)>,
@@ -101,6 +185,20 @@ impl EventPlan {
 }
 
 impl SearchCache {
+    fn is_small_uncommon_file(&self, path: &Path) -> bool {
+        if path
+            .extension()
+            .is_some_and(crate::query::common_file_extension)
+        {
+            return false;
+        }
+        self.node_index_for_path(path)
+            .and_then(|id| self.file_nodes[id].metadata.as_ref())
+            .is_some_and(|m| {
+                m.r#type() == NodeFileType::File && (0..SMALL_FILE_BYTES).contains(&m.size())
+            })
+    }
+
     pub fn plan_events(&mut self, events: &[FsEvent]) -> Result<EventPlan, HandleFSEError> {
         if events
             .iter()
@@ -249,5 +347,241 @@ impl SearchCache {
                 changes.record(id, node.name());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+    use std::fs;
+    use tempdir::TempDir;
+
+    fn event(path: &Path, id: u64, flag: EventFlag) -> FsEvent {
+        FsEvent {
+            path: path.to_owned(),
+            id,
+            flag: flag | EventFlag::ItemIsFile,
+        }
+    }
+
+    fn apply(plan: EventPlan, cache: &mut SearchCache) {
+        plan.read(
+            || false,
+            |change| {
+                cache.apply_observation(change);
+            },
+        );
+    }
+
+    #[test]
+    fn repeated_small_writes_read_once_by_the_original_deadline_and_hold_the_cursor() {
+        let temp = TempDir::new("small-file-events").unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let tiny = root.join("working.tmp");
+        let common = root.join("notes.MD");
+        fs::write(&tiny, [1]).unwrap();
+        fs::write(&common, [2]).unwrap();
+        let mut index = SearchCache::walk_fs_with_walk_data(
+            &WalkData::new(&root, &[], &[], true, || false),
+            &NEVER_STOPPED,
+        )
+        .unwrap();
+        let from = index.last_event_id();
+        let now = Instant::now();
+        let due = now + SMALL_FILE_INTERVAL;
+        let mut buffer = EventBuffer::default();
+        let modified = EventFlag::ItemModified;
+        for i in 0..4 {
+            let at = now + Duration::from_millis(i * 200);
+            let work = buffer
+                .prepare(&mut index, vec![event(&tiny, from + 1 + i, modified)], at)
+                .unwrap();
+            assert!(work.is_none());
+            assert_eq!(buffer.deadline(), Some(due));
+        }
+        fs::write(&common, [0; 13]).unwrap();
+        let (plan, urgent) = buffer
+            .prepare(&mut index, vec![event(&common, from + 5, modified)], now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(urgent.len(), 1);
+        apply(plan, &mut index);
+        assert_eq!(index.last_event_id(), from);
+        assert_eq!(
+            index.file_nodes[index.node_index_for_path(&common).unwrap()]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .size(),
+            13
+        );
+
+        // A checkpoint midway through a mixed batch must replay the deferred file on restart.
+        let db = temp.path().join("snapshot");
+        index.flush_snapshot_to_file(&db).unwrap();
+        let mut restored =
+            SearchCache::try_read_persistent_cache(&root, &db, &[], &[], &NEVER_STOPPED).unwrap();
+        assert_eq!(restored.last_event_id(), from);
+        fs::write(&tiny, [0; 4096]).unwrap();
+        restored
+            .handle_fs_events(vec![
+                event(&tiny, from + 4, modified),
+                event(&common, from + 5, modified),
+            ])
+            .unwrap();
+        let (plan, delayed) = buffer.prepare(&mut index, vec![], due).unwrap().unwrap();
+        assert_eq!(delayed.len(), 1);
+        assert_eq!(plan.paths.len(), 1);
+        apply(plan, &mut index);
+        assert_eq!(index.last_event_id(), from + 5);
+        assert_eq!(buffer.deadline(), None);
+        let id = index.node_index_for_path(&tiny).unwrap();
+        assert_eq!(
+            index.file_nodes[id].metadata,
+            restored.file_nodes[id].metadata
+        );
+        assert_eq!(index.file_nodes[id].metadata.as_ref().unwrap().size(), 4096);
+        assert!(
+            buffer
+                .prepare(&mut index, vec![event(&tiny, from + 6, modified)], due)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn eligibility_uses_cached_size_and_preserves_fast_formats_and_structural_events() {
+        let dir = TempDir::new("small-file-formats").unwrap();
+        let root = dir.path();
+        let slow = ["no-extension", "0.tmp", "4095.tmp"];
+        let fast = [
+            "a.TxT", "a.ZIP", "a.Md", "a.mID", "a.MIDI", "a.pdf", "a.png", "4096.tmp", "4097.tmp",
+        ];
+        for filename in slow.iter().chain(&fast) {
+            let size = filename
+                .split('.')
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(17);
+            fs::write(root.join(filename), vec![0; size]).unwrap();
+        }
+        let mut index = SearchCache::walk_fs_with_walk_data(
+            &WalkData::new(root, &[], &[], true, || false),
+            &NEVER_STOPPED,
+        )
+        .unwrap();
+        let mut buffer = EventBuffer::default();
+        let now = Instant::now();
+        let write = EventFlag::ItemModified;
+        let mut id = index.last_event_id();
+        for name in slow {
+            id += 1;
+            assert!(
+                buffer
+                    .prepare(&mut index, vec![event(&root.join(name), id, write)], now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for name in fast.into_iter().chain(["new.unknown"]) {
+            id += 1;
+            let (_, rows) = buffer
+                .prepare(&mut index, vec![event(&root.join(name), id, write)], now)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].path, root.join(name));
+        }
+        for flag in [
+            EventFlag::ItemCreated,
+            EventFlag::ItemRemoved,
+            EventFlag::ItemRenamed,
+            EventFlag::Cloned,
+            EventFlag::MustScanSubDirs,
+            EventFlag::IsHardlink,
+            EventFlag::ItemIsDir,
+            EventFlag::ItemIsSymlink,
+        ] {
+            assert!(!can_delay_write(flag | write | EventFlag::ItemIsFile));
+        }
+        let file = root.join("4095.tmp");
+        fs::remove_file(&file).unwrap();
+        let (plan, immediate) = buffer
+            .prepare(
+                &mut index,
+                vec![event(&file, id + 1, EventFlag::ItemRemoved)],
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(immediate[0].flag.contains(EventFlag::ItemRemoved));
+        apply(plan, &mut index);
+        assert!(index.node_index_for_path(&file).is_none());
+        assert!(!buffer.pending.contains_key(&file));
+        assert!(
+            buffer
+                .prepare(
+                    &mut index,
+                    vec![event(root, id + 2, EventFlag::KernelDropped)],
+                    now
+                )
+                .is_err()
+        );
+        let mut without_attributes = SearchCache::walk_fs(root);
+        assert!(
+            EventBuffer::default()
+                .prepare(
+                    &mut without_attributes,
+                    vec![event(&root.join("0.tmp"), 1, write)],
+                    now
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_full_buffer_reconciles_all_paths_without_waiting() {
+        let root = Path::new("/Volumes/synthetic-test");
+        let files = (0..=MAX_DEFERRED_PATHS)
+            .map(|i| Node {
+                name: format!("{i:05}.tmp").into(),
+                children: vec![],
+                metadata: Some(NodeMetadata {
+                    r#type: NodeFileType::File,
+                    size: 1,
+                    ctime: None,
+                    mtime: None,
+                }),
+            })
+            .collect();
+        let tree = Node {
+            name: "synthetic-test".into(),
+            children: files,
+            metadata: None,
+        };
+        let mut index = SearchCache::from_volume_tree(root, &tree, vec![], 10, &NEVER_STOPPED);
+        let events = tree
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                event(
+                    &root.join(file.name.as_ref()),
+                    11 + i as u64,
+                    EventFlag::ItemModified,
+                )
+            })
+            .collect();
+        let mut buffer = EventBuffer::default();
+        let (plan, all) = buffer
+            .prepare(&mut index, events, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.len(), MAX_DEFERRED_PATHS + 1);
+        assert_eq!(plan.paths.len(), all.len());
+        assert_eq!(plan.last_event, Some(11 + MAX_DEFERRED_PATHS as u64));
+        assert!(buffer.pending.is_empty());
     }
 }

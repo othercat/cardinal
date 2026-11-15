@@ -1189,6 +1189,34 @@ const EXECUTABLE_EXTENSIONS: &[&str] = &[
     "pkg",
 ];
 
+/// The same familiar formats offered by the search type filters get live updates.
+pub(crate) fn common_file_extension(ext: &std::ffi::OsStr) -> bool {
+    static COMMON: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+        std::sync::LazyLock::new(|| {
+            [
+                &["mid", "midi", "markdown", "xml"][..],
+                DOCUMENT_EXTENSIONS,
+                ARCHIVE_EXTENSIONS,
+                CODE_EXTENSIONS,
+                PICTURE_EXTENSIONS,
+                AUDIO_EXTENSIONS,
+                VIDEO_EXTENSIONS,
+                PRESENTATION_EXTENSIONS,
+                SPREADSHEET_EXTENSIONS,
+                EXECUTABLE_EXTENSIONS,
+            ]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+        });
+    ext.to_str().is_some_and(|s| {
+        COMMON.contains(s)
+            || (s.bytes().any(|b| b.is_ascii_uppercase())
+                && COMMON.contains(s.to_ascii_lowercase().as_str()))
+    })
+}
+
 #[derive(Clone, Copy)]
 enum DateField {
     Modified,

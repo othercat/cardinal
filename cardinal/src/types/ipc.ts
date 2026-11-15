@@ -14,12 +14,14 @@ export type IconUpdateWirePayload = {
   slabIndex: number;
   path?: string;
   icon?: string;
+  thumbnail?: boolean;
 };
 
 export type IconUpdatePayload = {
   slabIndex: SlabIndex;
   path?: string;
   icon?: string;
+  thumbnail?: boolean;
 };
 
 export type RecentEventPayload = {

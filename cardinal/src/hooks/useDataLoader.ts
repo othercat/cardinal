@@ -8,7 +8,7 @@ import type { IconUpdatePayload } from '../types/ipc';
 import type { FileChangeBatch } from '../types/ipc';
 
 export type DataLoaderCache = Map<SlabIndex, SearchResultItem>;
-type IconOverrideValue = { icon?: string; path?: string };
+type IconOverrideValue = { icon?: string; path?: string; thumbnail?: boolean };
 
 const fromNodeInfo = (node: NodeInfoResponse): SearchResultItem => ({
   path: node.path,
@@ -99,8 +99,12 @@ export function useDataLoader(
           const nextIcon = update.icon;
           const current = prev.get(slabIndex);
           if (current && update.path && current.path !== update.path) return;
-          iconOverridesRef.current.set(slabIndex, { icon: nextIcon, path: update.path });
-          if (!current || current.icon === nextIcon) {
+          iconOverridesRef.current.set(slabIndex, {
+            icon: nextIcon,
+            path: update.path,
+            thumbnail: update.thumbnail,
+          });
+          if (!current || (current.icon === nextIcon && current.thumbnail === update.thumbnail)) {
             return;
           }
 
@@ -108,7 +112,7 @@ export function useDataLoader(
             nextCache = new Map(prev);
           }
 
-          nextCache.set(slabIndex, { ...current, icon: nextIcon });
+          nextCache.set(slabIndex, { ...current, icon: nextIcon, thumbnail: update.thumbnail });
         });
 
         if (nextCache !== null) {
@@ -196,10 +200,10 @@ export function useDataLoader(
             ? (existing?.icon ?? normalizedItem.icon)
             : normalizedItem.icon;
 
-        const mergedItem =
-          preferredIcon === normalizedItem.icon
-            ? normalizedItem
-            : { ...normalizedItem, icon: preferredIcon };
+        const thumbnail =
+          iconOverridesRef.current.get(slabIndex)?.thumbnail ??
+          (samePath ? existing?.thumbnail : undefined);
+        const mergedItem = { ...normalizedItem, icon: preferredIcon, thumbnail };
 
         if (
           existing?.path === mergedItem.path &&

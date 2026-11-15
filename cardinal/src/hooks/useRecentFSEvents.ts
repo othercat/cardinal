@@ -1,18 +1,9 @@
 import { useEffect, useMemo, useReducer, useRef } from 'react';
 import { subscribeFSEventsBatch } from '../runtime/tauriEventRuntime';
 import type { RecentEventPayload } from '../types/ipc';
-import { splitPath } from '../utils/path';
 
 // Listen to batched file-system events and expose filtered projections for the UI.
 const MAX_EVENTS = 10000;
-
-type RecentEventRecord = {
-  payload: RecentEventPayload;
-  path: string;
-  name: string;
-  lowerPath: string;
-  lowerName: string;
-};
 
 type RecentEventsOptions = {
   caseSensitive: boolean;
@@ -25,7 +16,8 @@ export function useRecentFSEvents({
   isActive,
   eventFilterQuery,
 }: RecentEventsOptions) {
-  const eventsRef = useRef<RecentEventRecord[]>([]);
+  const eventsRef = useRef<RecentEventPayload[]>([]);
+  const nextSlot = useRef(0);
   const isActiveRef = useRef(isActive);
   const [bufferVersion, bumpBufferVersion] = useReducer((count: number) => count + 1, 0);
 
@@ -40,13 +32,10 @@ export function useRecentFSEvents({
     const unlistenEvents = subscribeFSEventsBatch((payload: RecentEventPayload[]) => {
       if (payload.length === 0) return;
 
-      const previous = eventsRef.current;
-      const normalizedBatch = payload.map(toEventRecord);
-      let updated = [...previous, ...normalizedBatch];
-      if (updated.length > MAX_EVENTS) {
-        updated = updated.slice(updated.length - MAX_EVENTS);
+      for (const event of payload) {
+        eventsRef.current[nextSlot.current] = event;
+        nextSlot.current = (nextSlot.current + 1) % MAX_EVENTS;
       }
-      eventsRef.current = updated;
 
       if (isActiveRef.current) {
         bumpBufferVersion();
@@ -55,47 +44,20 @@ export function useRecentFSEvents({
     return unlistenEvents;
   }, []);
 
-  const filteredEvents = useMemo(
-    () => filterBuffer(eventsRef.current, eventFilterQuery, caseSensitive),
-    // bufferVersion acts as the signal that the mutable eventsRef contents changed.
-    [eventFilterQuery, caseSensitive, bufferVersion],
-  );
+  const filteredEvents = useMemo(() => {
+    if (!isActive) return [];
+    const buffer = eventsRef.current;
+    const start = buffer.length === MAX_EVENTS ? nextSlot.current : 0;
+    const events = start ? buffer.slice(start).concat(buffer.slice(0, start)) : buffer.slice();
+    const query = eventFilterQuery.trim();
+    if (!query) return events;
+    const needle = caseSensitive ? query : query.toLowerCase();
+    return events.filter(({ path }) =>
+      (caseSensitive ? path : path.toLowerCase()).includes(needle),
+    );
+  }, [isActive, eventFilterQuery, caseSensitive, bufferVersion]);
 
   return {
     filteredEvents,
   };
 }
-
-const normalize = (value: string, caseSensitive: boolean): string =>
-  caseSensitive ? value : value.toLowerCase();
-
-const filterBuffer = (
-  events: RecentEventRecord[],
-  query: string,
-  caseSensitive: boolean,
-): RecentEventPayload[] => {
-  const trimmed = query.trim();
-  if (!trimmed) {
-    return events.map((record) => record.payload);
-  }
-  const comparable = normalize(trimmed, caseSensitive);
-  return events
-    .filter((record) => {
-      const haystackPath = caseSensitive ? record.path : record.lowerPath;
-      const haystackName = caseSensitive ? record.name : record.lowerName;
-      return haystackPath.includes(comparable) || haystackName.includes(comparable);
-    })
-    .map((record) => record.payload);
-};
-
-const toEventRecord = (payload: RecentEventPayload): RecentEventRecord => {
-  const path = payload.path || '';
-  const { name } = splitPath(path);
-  return {
-    payload,
-    path,
-    name,
-    lowerPath: path.toLowerCase(),
-    lowerName: name.toLowerCase(),
-  };
-};
