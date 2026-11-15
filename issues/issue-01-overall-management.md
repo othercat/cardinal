@@ -12,4 +12,6 @@
 
 ## 历史产物
 
-本次接入前无 `process-root/`、`delivery-root/`、`docs/`、`issues/`。现有产品文档位于 `doc/`；用户指定的官网下载应用路径为 `/Applications/Cardinal.app`，本任务不移动、不覆盖。最终只读复核时该路径不存在；本任务未对“应用程序”目录执行安装或删除，新应用保存在 delivery-root。
+本次接入前无 `process-root/`、`delivery-root/`、`docs/`、`issues/`。已有产品文档位于 `doc/`。
+
+2026-11-15 清理后，本机 `delivery-root/releases/` 只保留 r4 的 ZIP 和 SHA-256 校验文件。旧版解包副本、测试工作区和构建缓存已清除。实测报告与私有补齐快照归档到 `delivery-root/artifacts/cardinal-issue-2/`。源码与验收记录见 [GitHub Issue #2](https://github.com/othercat/cardinal/issues/2)。
