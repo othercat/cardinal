@@ -8,6 +8,7 @@ pub enum AppLifecycleState {
     Initializing = 0,
     Updating = 1,
     Ready = 2,
+    LoadingIndex = 3,
 }
 
 impl AppLifecycleState {
@@ -16,6 +17,7 @@ impl AppLifecycleState {
             0 => Self::Initializing,
             1 => Self::Updating,
             2 => Self::Ready,
+            3 => Self::LoadingIndex,
             _ => Self::Initializing,
         }
     }
@@ -25,6 +27,7 @@ impl AppLifecycleState {
             Self::Initializing => "Initializing",
             Self::Updating => "Updating",
             Self::Ready => "Ready",
+            Self::LoadingIndex => "LoadingIndex",
         }
     }
 }

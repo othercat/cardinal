@@ -94,7 +94,7 @@ export function PreferencesOverlay({
       setThresholdInput(sortThreshold.toString());
       return;
     }
-    const normalized = Math.max(1, Math.round(parsed));
+    const normalized = Math.max(0, Math.round(parsed));
     onSortThresholdChange(normalized);
     setThresholdInput(normalized.toString());
   }, [onSortThresholdChange, sortThreshold, thresholdInput]);

@@ -33,28 +33,31 @@ const createEventsPanelRef = () =>
   }) as unknown as RefObject<FSEventsPanelHandle | null>;
 
 describe('useFilesTabEffects', () => {
-  it('clears selection and closes Quick Look when switching to events tab', async () => {
+  it('keeps the file selection and closes Quick Look when switching to events', async () => {
     const clearSelection = vi.fn();
     const closeQuickLook = vi.fn();
     const updateQuickLook = vi.fn();
     const virtualListRef = createVirtualListRef();
     const eventsPanelRef = createEventsPanelRef();
 
-    renderHook((props: HookProps) => useFilesTabEffects(props), {
-      initialProps: {
-        activeTab: 'events',
-        selectedIndices: [0],
-        activeRowIndex: null,
-        closeQuickLook,
-        updateQuickLook,
-        clearSelection,
-        resultsVersion: 1,
-        virtualListRef,
-        eventsPanelRef,
-      },
+    const props: HookProps = {
+      activeTab: 'files',
+      selectedIndices: [0],
+      activeRowIndex: null,
+      closeQuickLook,
+      updateQuickLook,
+      clearSelection,
+      resultsVersion: 1,
+      virtualListRef,
+      eventsPanelRef,
+    };
+    const { rerender } = renderHook((options: HookProps) => useFilesTabEffects(options), {
+      initialProps: props,
     });
-
-    expect(clearSelection).toHaveBeenCalledTimes(2);
+    clearSelection.mockClear();
+    updateQuickLook.mockClear();
+    rerender({ ...props, activeTab: 'events' });
+    expect(clearSelection).not.toHaveBeenCalled();
     expect(closeQuickLook).toHaveBeenCalledTimes(1);
     expect(updateQuickLook).not.toHaveBeenCalled();
 

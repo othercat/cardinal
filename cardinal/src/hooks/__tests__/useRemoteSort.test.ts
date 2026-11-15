@@ -50,6 +50,7 @@ describe('useRemoteSort', () => {
       expect(mockedInvoke).toHaveBeenCalledWith('get_sorted_view', {
         results,
         sort: { key: 'filename', direction: 'asc' },
+        requestId: expect.any(Number),
       });
     });
     await waitFor(() => {
@@ -109,6 +110,82 @@ describe('useRemoteSort', () => {
     expect(result.current.displayedResults).toEqual(results);
   });
 
+  it('sorts more than 20000 results and migrates the old default limit', async () => {
+    window.localStorage.setItem('cardinal.sortThreshold', '20000');
+    const results = toSlabIndices(Array.from({ length: 25001 }, (_, i) => i));
+    mockedInvoke.mockResolvedValue([...results].reverse());
+    const { result } = renderHook(() => useRemoteSort(results, 1, 'en-US', () => null));
+    act(() => result.current.handleSortToggle('filename'));
+    await waitFor(() => expect(result.current.displayedResults[0]).toBe(25000));
+    expect(result.current.displayedResults).toHaveLength(results.length);
+    expect(result.current.sortThreshold).toBe(0);
+    expect(result.current.canSort).toBe(true);
+  });
+
+  it('retains an explicitly chosen 20000 limit after remounting', () => {
+    const results = toSlabIndices([1]);
+    const first = renderHook(() => useRemoteSort(results, 1, 'en-US', () => null));
+    act(() => first.result.current.setSortThreshold(20000));
+    first.unmount();
+    const second = renderHook(() => useRemoteSort(results, 1, 'en-US', () => null));
+    expect(second.result.current.sortThreshold).toBe(20000);
+  });
+
+  it('shows current results rather than a previous sorted view while a refresh is pending', async () => {
+    const initial = toSlabIndices([0, 1, 2]);
+    const next = toSlabIndices([10, 11, 12]);
+    const pending = createDeferred();
+    const { result, rerender } = renderHook(
+      ({ items, version }) => useRemoteSort(items, version, 'en-US', () => null),
+      { initialProps: { items: initial, version: 1 } },
+    );
+    act(() => result.current.handleSortToggle('size'));
+    await waitFor(() => expect(result.current.displayedResults[0]).toBe(2));
+    mockedInvoke.mockReturnValueOnce(pending.promise);
+    rerender({ items: next, version: 2 });
+    expect(result.current.displayedResults).toBe(next);
+    await act(async () => pending.resolve([...next].reverse()));
+    expect(result.current.displayedResults).toEqual([...next].reverse());
+  });
+
+  it('settles failed sorting without an unhandled rejection or stale rows', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockedInvoke.mockRejectedValueOnce(new Error('backend unavailable'));
+    const results = toSlabIndices([1, 2]);
+    const { result } = renderHook(() => useRemoteSort(results, 1, 'en-US', () => null));
+    act(() => result.current.handleSortToggle('filename'));
+    await waitFor(() => expect(log).toHaveBeenCalled());
+    expect(result.current.isSorting).toBe(false);
+    expect(result.current.displayedResults).toBe(results);
+    log.mockRestore();
+  });
+
+  it('keeps the completed order and viewport version while silently re-sorting live data', async () => {
+    const initial = toSlabIndices([0, 1, 2]);
+    const pending = createDeferred();
+    const { result, rerender } = renderHook(
+      ({ items, version }) =>
+        useRemoteSort(items, version, 'en-US', () => null, { queryVersion: 1, fileChanges: null }),
+      { initialProps: { items: initial, version: 1 } },
+    );
+    act(() => result.current.handleSortToggle('size'));
+    await waitFor(() => expect(result.current.displayedResults).toEqual([2, 1, 0]));
+    const order = result.current.displayedResults;
+    const version = result.current.displayedResultsVersion;
+    mockedInvoke.mockReturnValueOnce(pending.promise);
+    rerender({ items: [...initial], version: 2 });
+    expect(result.current.displayedResults).toBe(order);
+    expect(result.current.displayedResultsVersion).toBe(version);
+    expect(result.current.displayedDataVersion).toBe(1);
+    expect(result.current.sortButtonsDisabled).toBe(false);
+    await act(async () => {
+      pending.resolve([2, 1, 0] as SlabIndex[]);
+    });
+    expect(result.current.displayedResults).toBe(order);
+    expect(result.current.displayedResultsVersion).toBe(version);
+    expect(result.current.displayedDataVersion).toBe(2);
+  });
+
   it('preserves current sort state when result count stays within threshold (including empty results)', async () => {
     const initial = toSlabIndices([0, 1, 2]);
 
@@ -161,7 +238,7 @@ describe('useRemoteSort', () => {
     expect(mockedInvoke).not.toHaveBeenCalled();
   });
 
-  it('clears current sort state when result count exceeds threshold', async () => {
+  it('preserves current sort state when an optional limit is exceeded', async () => {
     window.localStorage.setItem('cardinal.sortThreshold', '2');
     const initial = toSlabIndices([0, 1]);
     const overLimit = toSlabIndices([0, 1, 2]);
@@ -193,8 +270,9 @@ describe('useRemoteSort', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.sortState).toBeNull();
+      expect(result.current.sortState).toEqual({ key: 'filename', direction: 'asc' });
     });
+    expect(result.current.displayedResults).toEqual(overLimit);
   });
 
   it('bumps displayedResultsVersion when switching sorted projection on then off', async () => {
@@ -263,6 +341,9 @@ describe('useRemoteSort', () => {
     await waitFor(() => {
       expect(mockedInvoke).toHaveBeenCalledTimes(2);
     });
+    const firstId = (mockedInvoke.mock.calls[0][1] as { requestId: number }).requestId;
+    const secondId = (mockedInvoke.mock.calls[1][1] as { requestId: number }).requestId;
+    expect(secondId).toBeGreaterThan(firstId);
 
     act(() => {
       firstRequest.resolve(toSlabIndices([2, 1, 0]));

@@ -11,12 +11,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: nightly-2025-05-09
+  RUST_TOOLCHAIN: nightly-2025-12-11
 
 jobs:
   rust:
     name: Rust ${{ matrix.name }}
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +48,7 @@ jobs:
 
   bench:
     name: search-cache bench (large corpus)
-    runs-on: macos-14
+    runs-on: macos-15
     # Run only on master push, manual trigger, or PRs with "perf:" title
     if: |
       github.event_name == 'push' || 
@@ -101,7 +101,7 @@ jobs:
 
   tauri:
     name: Tauri ${{ matrix.name }}
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:

@@ -5,7 +5,7 @@ use crate::{
         QuickLookItemInput, close_preview_panel, toggle_preview_panel, update_preview_panel,
     },
     search_activity,
-    sort::{SortEntry, SortStatePayload, sort_entries},
+    sort::SortStatePayload,
     window_controls::{activate_main_window_impl, hide_main_window_impl, toggle_main_window_impl},
 };
 use anyhow::{Result, anyhow};
@@ -20,13 +20,14 @@ use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPa
 use objc2_foundation::{NSArray, NSString, NSURL};
 use parking_lot::Mutex;
 use search_cache::{
-    SearchOptions, SearchOutcome, SearchQuery, SearchResultNode, SlabIndex, SlabNodeMetadata,
+    ResultEdit, SearchOptions, SearchQuery, SearchResultNode, SlabIndex, SlabNodeMetadata, SortKey,
+    ViewUpdate,
 };
 use search_cancel::CancellationToken;
 use serde::{Deserialize, Serialize};
 use std::{cell::LazyCell, process::Command};
 use tauri::{ActivationPolicy, AppHandle, State};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 #[derive(Debug, Clone)]
 pub struct WatchConfigUpdate {
@@ -54,28 +55,45 @@ pub struct SearchJob {
     pub query: SearchQuery,
     pub options: SearchOptionsPayload,
     pub cancellation_token: CancellationToken,
-    pub result_tx: Sender<Result<SearchOutcome>>,
+    pub base_view_id: Option<u64>,
+    pub sort_key: Option<SortKey>,
+    pub result_tx: Sender<Result<SearchResponse>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct NodeInfoRequest {
-    pub slab_indices: Vec<SlabIndex>,
-    pub response_tx: Sender<Vec<SearchResultNode>>,
+pub enum NodeInfoRequest {
+    Rows {
+        slab_indices: Vec<SlabIndex>,
+        response_tx: Sender<Vec<SearchResultNode>>,
+    },
+    Page {
+        view_id: u64,
+        sort: Option<SortStatePayload>,
+        offset: usize,
+        limit: usize,
+        locate: Option<Vec<SlabIndex>>,
+        response_tx: Sender<Option<Vec<u32>>>,
+    },
 }
 
-#[derive(Default)]
-struct SortedViewCache {
-    slab_indices: Vec<SlabIndex>,
-    nodes: Vec<SearchResultNode>,
+#[derive(Debug, Clone)]
+pub struct SortJob {
+    pub paged: bool,
+    pub view_id: Option<u64>,
+    pub slab_indices: Vec<SlabIndex>,
+    pub sort: SortStatePayload,
+    pub cancellation_token: CancellationToken,
+    pub response_tx: Sender<Option<Vec<SlabIndex>>>,
 }
 
 pub struct SearchState {
     search_tx: Sender<SearchJob>,
     node_info_tx: Sender<NodeInfoRequest>,
+    sort_tx: Sender<SortJob>,
+    latest_sort_request: Mutex<u64>,
     icon_viewport_tx: Sender<(u64, Vec<SlabIndex>)>,
     rescan_tx: Sender<CancellationToken>,
     watch_config_tx: Sender<WatchConfigUpdate>,
-    sorted_view_cache: Mutex<Option<SortedViewCache>>,
     pub(crate) update_window_state_tx: Sender<()>,
 }
 
@@ -83,6 +101,7 @@ impl SearchState {
     pub fn new(
         search_tx: Sender<SearchJob>,
         node_info_tx: Sender<NodeInfoRequest>,
+        sort_tx: Sender<SortJob>,
         icon_viewport_tx: Sender<(u64, Vec<SlabIndex>)>,
         rescan_tx: Sender<CancellationToken>,
         watch_config_tx: Sender<WatchConfigUpdate>,
@@ -91,10 +110,11 @@ impl SearchState {
         Self {
             search_tx,
             node_info_tx,
+            sort_tx,
+            latest_sort_request: Mutex::new(0),
             icon_viewport_tx,
             rescan_tx,
             watch_config_tx,
-            sorted_view_cache: Mutex::new(None),
             update_window_state_tx,
         }
     }
@@ -105,7 +125,7 @@ impl SearchState {
         }
 
         let (response_tx, response_rx) = bounded::<Vec<SearchResultNode>>(1);
-        if let Err(e) = self.node_info_tx.send(NodeInfoRequest {
+        if let Err(e) = self.node_info_tx.send(NodeInfoRequest::Rows {
             slab_indices,
             response_tx,
         }) {
@@ -118,28 +138,17 @@ impl SearchState {
             Vec::new()
         })
     }
+}
 
-    fn fetch_sorted_nodes(&self, slab_indices: &[SlabIndex]) -> Vec<SearchResultNode> {
-        if slab_indices.is_empty() {
-            return Vec::new();
-        }
-
-        let mut cache_guard = self.sorted_view_cache.lock();
-        if let Some(cached) = cache_guard
-            .as_ref()
-            .filter(|cache| cache.slab_indices == slab_indices)
-            .map(|cache| cache.nodes.clone())
-        {
-            return cached;
-        }
-
-        let nodes = self.request_nodes(slab_indices.to_vec());
-        *cache_guard = Some(SortedViewCache {
-            slab_indices: slab_indices.to_vec(),
-            nodes: nodes.clone(),
-        });
-        nodes
+fn begin_sort_request(latest_request: &Mutex<u64>, request_id: u64) -> Option<CancellationToken> {
+    let mut latest = latest_request.lock();
+    if request_id <= *latest {
+        return None;
     }
+    *latest = request_id;
+    // Serialize admission and token creation: late older IPC calls must never
+    // cancel a newer request that has already entered the blocking pool.
+    Some(CancellationToken::new_sort())
 }
 
 /// Normalizes user-provided path input into an absolute path string.
@@ -219,17 +228,21 @@ pub struct NodeInfo {
     pub icon: Option<String>,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
-    pub results: Vec<SlabIndex>,
-    pub highlights: Vec<String>,
-    pub status_code: u8,
+    #[serde(flatten)]
+    pub view: ViewUpdate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sorted: Option<SortedEdits>,
 }
 
-impl SearchResponse {
-    pub const OK: u8 = 0;
-    pub const CANCELLED: u8 = 1;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SortedEdits {
+    pub base_view_id: u64,
+    pub key: SortKey,
+    pub edits: Vec<ResultEdit>,
 }
 
 #[derive(Serialize)]
@@ -281,17 +294,27 @@ pub async fn toggle_quicklook(app_handle: AppHandle, items: Vec<QuickLookItemInp
     }
 }
 
-#[tauri::command]
-pub async fn search(
+#[tauri::command(async)]
+pub fn search(
     directory_query: Option<String>,
     query: Option<String>,
     options: Option<SearchOptionsPayload>,
+    background: Option<bool>,
+    base_view_id: Option<u64>,
+    sort_key: Option<SortKey>,
     state: State<'_, SearchState>,
 ) -> Result<SearchResponse, String> {
-    search_activity::note_search_activity();
+    let background = background.unwrap_or(false);
+    if !background {
+        search_activity::note_search_activity();
+    }
 
     let options = options.unwrap_or_default();
-    let cancellation_token = CancellationToken::new_search();
+    let cancellation_token = if background {
+        CancellationToken::background_search()
+    } else {
+        CancellationToken::new_search()
+    };
     let (result_tx, result_rx) = bounded(1);
     if let Err(e) = state.search_tx.send(SearchJob {
         query: SearchQuery {
@@ -299,6 +322,8 @@ pub async fn search(
             query,
         },
         options,
+        base_view_id,
+        sort_key,
         cancellation_token,
         result_tx,
     }) {
@@ -306,29 +331,10 @@ pub async fn search(
         return Err(format!("Failed to send search request: {e:?}"));
     }
 
-    match result_rx.recv() {
-        Ok(res) => res,
-        Err(e) => {
-            error!("Failed to receive search result: {e:?}");
-            return Err(format!("Failed to receive search result: {e:?}"));
-        }
-    }
-    .map(|SearchOutcome { nodes, highlights }| {
-        let (status_code, results) = match nodes {
-            Some(list) => (SearchResponse::OK, list),
-            None => {
-                let version = cancellation_token.version();
-                info!("Search {version} was cancelled");
-                (SearchResponse::CANCELLED, vec![])
-            }
-        };
-        SearchResponse {
-            results,
-            highlights,
-            status_code,
-        }
-    })
-    .map_err(|e| format!("Failed to process search result: {e:?}"))
+    result_rx
+        .recv()
+        .map_err(|e| format!("Failed to receive search result: {e}"))?
+        .map_err(|e| format!("Failed to process search result: {e}"))
 }
 
 #[tauri::command(async)]
@@ -368,26 +374,68 @@ pub fn get_nodes_info(
 }
 
 #[tauri::command(async)]
-pub fn get_sorted_view(
-    results: Vec<SlabIndex>,
+pub fn get_view_page(
+    view_id: u64,
     sort: Option<SortStatePayload>,
+    offset: usize,
+    limit: usize,
+    locate: Option<Vec<SlabIndex>>,
     state: State<'_, SearchState>,
-) -> Vec<SlabIndex> {
-    if results.is_empty() || sort.is_none() {
-        return results;
+) -> Result<Vec<u32>, String> {
+    let (response_tx, rx) = bounded(1);
+    state
+        .node_info_tx
+        .send(NodeInfoRequest::Page {
+            view_id,
+            sort,
+            offset,
+            limit: limit.min(1024),
+            locate,
+            response_tx,
+        })
+        .map_err(|e| e.to_string())?;
+    rx.recv()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "File view has changed".into())
+}
+
+#[tauri::command(async)]
+pub fn get_sorted_view(
+    paged: Option<bool>,
+    results: Option<Vec<SlabIndex>>,
+    view_id: Option<u64>,
+    sort: Option<SortStatePayload>,
+    request_id: u64,
+    state: State<'_, SearchState>,
+) -> Result<tauri::ipc::Response, String> {
+    let cancellation_token = begin_sort_request(&state.latest_sort_request, request_id)
+        .ok_or_else(|| "Sort superseded".to_string())?;
+    let Some(sort) = sort else {
+        return Ok(tauri::ipc::Response::new(Vec::<u8>::new()));
+    };
+    let (response_tx, response_rx) = bounded(1);
+    state
+        .sort_tx
+        .send(SortJob {
+            paged: paged.unwrap_or(false),
+            view_id,
+            slab_indices: results.unwrap_or_default(),
+            sort,
+            cancellation_token,
+            response_tx,
+        })
+        .map_err(|e| format!("Failed to send sort request: {e}"))?;
+    let ids = response_rx
+        .recv()
+        .map_err(|e| format!("Failed to receive sort result: {e}"))?
+        .ok_or_else(|| "Sort cancelled".to_string())?;
+    // Tauri sends raw IPC bytes to WKWebView. Large IDs never form JSON
+    // decimal strings on either side. Sorting by handle also avoids uploading them.
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in ids {
+        bytes.extend_from_slice(&(id.get() as u32).to_le_bytes());
     }
-
-    let sort_state = sort.expect("checked above");
-    let nodes = state.fetch_sorted_nodes(&results);
-    let mut entries: Vec<SortEntry> = results
-        .into_iter()
-        .zip(nodes)
-        .map(|(slab_index, node)| SortEntry::new(slab_index, node))
-        .collect();
-
-    sort_entries(&mut entries, &sort_state);
-
-    entries.into_iter().map(|entry| entry.slab_index).collect()
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command(async)]
@@ -542,6 +590,15 @@ fn copy_files_to_clipboard_impl(paths: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_older_sort_request_is_rejected_before_creating_a_token() {
+        let latest = Mutex::new(0);
+        assert!(begin_sort_request(&latest, 20).is_some());
+        assert!(begin_sort_request(&latest, 10).is_none());
+        assert!(begin_sort_request(&latest, 20).is_none());
+        assert_eq!(*latest.lock(), 20);
+    }
 
     #[test]
     fn normalize_rejects_empty_input() {

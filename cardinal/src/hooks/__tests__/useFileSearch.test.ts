@@ -4,9 +4,14 @@ import { invoke } from '@tauri-apps/api/core';
 import type { SlabIndex } from '../../types/slab';
 import { DIRECTORY_SCOPE_OPEN_STORAGE_KEY, useFileSearch } from '../useFileSearch';
 import { SearchStatusCode } from '../../types/ipc';
+import { useLiveSearchRefresh } from '../useLiveSearchRefresh';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
+}));
+
+vi.mock('../useLiveSearchRefresh', () => ({
+  useLiveSearchRefresh: vi.fn(),
 }));
 
 const mockedInvoke = vi.mocked(invoke);
@@ -58,6 +63,81 @@ describe('useFileSearch', () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('refreshes row data without resetting the viewport query version', async () => {
+    mockSearchSuccess([1, 2] as SlabIndex[]);
+    const { result } = await renderReadySearchHook();
+    const before = result.current.state;
+    const calls = vi.mocked(useLiveSearchRefresh).mock.calls;
+    const refresh = calls[calls.length - 1][0];
+    await act(async () => {
+      await refresh(null);
+    });
+    expect(result.current.state.resultsVersion).toBe(before.resultsVersion + 1);
+    expect(result.current.state.queryVersion).toBe(before.queryVersion);
+    act(() => result.current.queueSearch('changed', { immediate: true }));
+    await waitFor(() => expect(result.current.state.queryVersion).toBe(before.queryVersion + 1));
+  });
+
+  it('keeps slow background searches silent and ignores their response after user input', async () => {
+    const initial = [1, 2] as SlabIndex[];
+    mockSearchSuccess(initial);
+    const { result } = await renderReadySearchHook();
+    let finish!: (value: ReturnType<typeof searchResponse>) => void;
+    mockedInvoke.mockImplementation((command, args) => {
+      if (command === 'search' && (args as { background?: boolean })?.background) {
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      }
+      return Promise.resolve(searchResponse([9] as SlabIndex[]));
+    });
+    const calls = vi.mocked(useLiveSearchRefresh).mock.calls;
+    const refresh = calls[calls.length - 1][0];
+    let pending!: Promise<unknown>;
+    await act(async () => {
+      pending = refresh(null);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 220));
+    });
+    expect(result.current.state.showLoadingUI).toBe(false);
+    expect(result.current.state.results).toBe(initial);
+    act(() => result.current.queueSearch('user query', { immediate: true }));
+    await waitFor(() => expect(result.current.state.currentQuery).toBe('user query'));
+    await act(async () => {
+      finish(searchResponse([3] as SlabIndex[]));
+      await pending;
+    });
+    expect(result.current.state.results).toEqual([9]);
+    expect(result.current.state.showLoadingUI).toBe(false);
+  });
+
+  it('lets a user sort finish before starting the next live query', async () => {
+    mockSearchSuccess([1, 2] as SlabIndex[]);
+    const { result } = await renderReadySearchHook();
+    let finish!: () => void;
+    result.current.pendingSortRef.current = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const calls = vi.mocked(useLiveSearchRefresh).mock.calls;
+    const refresh = calls[calls.length - 1][0];
+    const before = mockedInvoke.mock.calls.length;
+    let pending!: Promise<unknown>;
+    await act(async () => {
+      pending = refresh(null);
+    });
+    expect(mockedInvoke).toHaveBeenCalledTimes(before);
+    await act(async () => {
+      result.current.pendingSortRef.current = null;
+      finish();
+      await pending;
+    });
+    expect(mockedInvoke).toHaveBeenCalledWith(
+      'search',
+      expect.objectContaining({ background: true }),
+    );
   });
 
   it('reuses backend results array without copying', async () => {

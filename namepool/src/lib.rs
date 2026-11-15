@@ -51,11 +51,14 @@ impl NamePool {
     /// and won't be overwritten.
     pub fn push<'c>(&'c self, name: &str) -> &'c str {
         let mut inner = self.inner.lock();
-        if !inner.contains(name) {
-            inner.insert(name.into());
+        if let Some(existing) = inner.get(name) {
+            return unsafe { str::from_raw_parts(existing.as_ptr(), existing.len()) };
         }
-        let existing = inner.get(name).unwrap();
-        unsafe { str::from_raw_parts(existing.as_ptr(), existing.len()) }
+        let owned = Box::<str>::from(name);
+        let ptr = owned.as_ptr();
+        inner.insert(owned);
+        // The pool only inserts; moving a Box in the tree leaves its bytes in place.
+        unsafe { str::from_raw_parts(ptr, name.len()) }
     }
 
     pub fn search_substr<'search, 'pool: 'search>(
@@ -93,12 +96,21 @@ impl NamePool {
         prefix: &'search str,
         cancellation_token: CancellationToken,
     ) -> Option<BTreeSet<&'pool str>> {
+        cancellation_token.is_cancelled()?;
         let mut result = BTreeSet::new();
-        for (i, x) in self.inner.lock().iter().enumerate() {
+        let inner = self.inner.lock();
+        for (i, x) in inner
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .enumerate()
+        {
             cancellation_token.is_cancelled_sparse(i)?;
-            if x.starts_with(prefix) {
-                result.insert(unsafe { str::from_raw_parts(x.as_ptr(), x.len()) });
+            if !x.starts_with(prefix) {
+                break;
             }
+            result.insert(unsafe { str::from_raw_parts(x.as_ptr(), x.len()) });
         }
 
         Some(result)
@@ -120,19 +132,15 @@ impl NamePool {
         Some(result)
     }
 
-    // `exact` should starts with a '\0', and ends with a '\0',
-    // e.g. b"\0hello\0"
     pub fn search_exact<'search, 'pool: 'search>(
         &'pool self,
         exact: &'search str,
         cancellation_token: CancellationToken,
     ) -> Option<BTreeSet<&'pool str>> {
+        cancellation_token.is_cancelled()?;
         let mut result = BTreeSet::new();
-        for (i, x) in self.inner.lock().iter().enumerate() {
-            cancellation_token.is_cancelled_sparse(i)?;
-            if &**x == exact {
-                result.insert(unsafe { str::from_raw_parts(x.as_ptr(), x.len()) });
-            }
+        if let Some(x) = self.inner.lock().get(exact) {
+            result.insert(unsafe { str::from_raw_parts(x.as_ptr(), x.len()) });
         }
         Some(result)
     }
@@ -144,6 +152,31 @@ mod tests {
 
     fn guard<T>(value: Option<T>) -> T {
         value.expect("noop cancellation should not trigger")
+    }
+
+    #[test]
+    fn indexed_prefix_handles_unicode_empty_and_absent_bounds() {
+        let pool = NamePool::new();
+        for name in ["", "alpha", "中文", "中文资料", "中间", "终点"] {
+            pool.push(name);
+        }
+        assert_eq!(
+            prefix_search(&pool, "中文"),
+            BTreeSet::from(["中文", "中文资料"])
+        );
+        assert_eq!(prefix_search(&pool, "").len(), pool.len());
+        assert!(prefix_search(&pool, "zzzz").is_empty());
+        assert!(exact_search(&pool, "absent").is_empty());
+        assert_eq!(exact_search(&pool, ""), BTreeSet::from([""]));
+    }
+
+    #[test]
+    fn indexed_lookups_honor_cancellation_even_with_no_matches() {
+        let pool = NamePool::new();
+        let token = CancellationToken::new_search();
+        let _ = CancellationToken::new_search();
+        assert!(pool.search_exact("absent", token).is_none());
+        assert!(pool.search_prefix("absent", token).is_none());
     }
 
     fn substr<'pool>(pool: &'pool NamePool, needle: &str) -> BTreeSet<&'pool str> {

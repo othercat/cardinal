@@ -28,6 +28,7 @@
     "created": "Created"
   },
   "sorting": {
+    "inProgress": "Sorting all results",
     "disabled": "Sorting is disabled. Too many results ({{limit}}+) may impact performance. You can adjust the threshold in Preferences."
   },
   "events": {
@@ -55,13 +56,15 @@
     "resetColumnWidths": "Reset Column Widths"
   },
   "statusBar": {
+    "metadataProgress": "Loading sizes and dates {{done}} / {{total}} · unknown values sort last",
     "tabs": {
       "files": "Files",
       "events": "Events"
     },
     "lifecycle": {
+      "LoadingIndex": "Loading saved index",
       "Initializing": "Initializing",
-      "Updating": "Updating",
+      "Updating": "Catching up on file changes",
       "Ready": "Ready"
     },
     "aria": {
@@ -132,7 +135,7 @@
       "label": "Show tray icon"
     },
     "sortingLimit": {
-      "label": "Sorting limit"
+      "label": "Sorting limit (0 = unlimited)"
     },
     "save": "Save",
     "reset": "Restore defaults",

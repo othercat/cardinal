@@ -1,3 +1,4 @@
+import type { ResultPages } from '../utils/resultPages';
 // React & libs
 import React, {
   useRef,
@@ -16,8 +17,12 @@ import { useFrozenViewport } from '../hooks/useFrozenViewport';
 import type { SearchResultItem } from '../types/search';
 import type { SlabIndex } from '../types/slab';
 import { useIconViewport } from '../hooks/useIconViewport';
+import type { FileChangeBatch } from '../types/ipc';
+
+import type { LoadedWindow } from '../utils/sortLoadedRows';
 
 export type VirtualListHandle = {
+  getLoadedWindow?: () => LoadedWindow | null;
   scrollToTop: () => void;
   scrollToRow: (rowIndex: number, align?: 'nearest' | 'start' | 'end' | 'center') => void;
   ensureRangeLoaded: (startIndex: number, endIndex: number) => Promise<void> | void;
@@ -26,11 +31,15 @@ export type VirtualListHandle = {
 
 type VirtualListProps = {
   results: SlabIndex[];
-  // Raw data version from search responses; resets useDataLoader's row cache.
+  pages?: ResultPages;
+  // Committed data epoch; live updates revalidate changed paths in place.
   dataResultsVersion: number;
   // Visible ordering/version token; drives viewport/icon hydration refreshes and frozen-view
   // transitions even when the underlying row payloads are unchanged.
   displayedResultsVersion: number;
+  queryVersion?: number;
+  fileChanges?: FileChangeBatch;
+  changedIds?: readonly number[];
   rowHeight: number;
   overscan: number;
   renderRow: (
@@ -46,8 +55,12 @@ type VirtualListProps = {
 export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(function VirtualList(
   {
     results,
+    pages,
     dataResultsVersion,
     displayedResultsVersion,
+    queryVersion = dataResultsVersion,
+    fileChanges = null,
+    changedIds,
     rowHeight,
     overscan,
     renderRow,
@@ -64,10 +77,17 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
 
   // ----- derived -----
   // Row count is inferred from the results array; explicit rowCount is no longer supported
-  const rowCount = results.length;
+  const rowCount = pages?.length ?? results.length;
 
   // ----- data loader -----
-  const { cache, ensureRangeLoaded } = useDataLoader(results, dataResultsVersion);
+  const { cache, ensureRangeLoaded, pageVersion } = useDataLoader(
+    results,
+    dataResultsVersion,
+    queryVersion,
+    fileChanges,
+    changedIds,
+    pages,
+  );
 
   // Virtualized height powers the scrollbar math
   const totalHeight = rowCount * rowHeight;
@@ -81,7 +101,7 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
     rowCount && viewportHeight
       ? Math.min(rowCount - 1, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan - 1)
       : -1;
-  useIconViewport({ results, resultsVersion: displayedResultsVersion, start, end });
+  useIconViewport({ results, pages, resultsVersion: displayedResultsVersion, start, end });
 
   // Clamp scroll updates so callers cannot push the viewport outside legal bounds
   const updateScrollAndRange = useCallback(
@@ -125,7 +145,7 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
   // Ensure the data cache stays warm for the active window
   useEffect(() => {
     if (end >= start) ensureRangeLoaded(start, end);
-  }, [start, end, ensureRangeLoaded, displayedResultsVersion]);
+  }, [start, end, ensureRangeLoaded, displayedResultsVersion, dataResultsVersion]);
 
   // Track container height changes so virtualization recalculates the viewport
   useLayoutEffect(() => {
@@ -191,10 +211,10 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
 
   const getItemByRowIndex = useCallback(
     (rowIndex: number) => {
-      const slabIndex = results[rowIndex];
+      const slabIndex = pages ? pages.idAt(rowIndex) : results[rowIndex];
       return slabIndex === undefined ? undefined : cache.get(slabIndex);
     },
-    [cache, results],
+    [cache, results, pages, pageVersion],
   );
 
   // The frozen viewport can be dropped once every row in the active window has fresh data.
@@ -215,12 +235,40 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
   useImperativeHandle(
     ref,
     () => ({
+      getLoadedWindow: () => {
+        const first = Math.max(0, Math.floor(scrollTop / rowHeight));
+        const last = Math.min(rowCount, Math.ceil((scrollTop + viewportHeight) / rowHeight));
+        if (pages || last <= first || rowCount > 1024) return null;
+        // Include the entire list when the overscan already hydrated it.
+        const all = rowCount <= 1024 && results.every((id) => cache.has(id));
+        const start = all ? 0 : first;
+        const rows = [];
+        for (let i = start; i < (all ? rowCount : last); i++) {
+          const id = results[i];
+          const item = cache.get(id);
+          if (!item?.path) return null;
+          rows.push({ id, item });
+        }
+        return { start, rows };
+      },
       scrollToTop: () => updateScrollAndRange(() => 0),
       scrollToRow,
       ensureRangeLoaded,
       getItem: getItemByRowIndex,
     }),
-    [updateScrollAndRange, scrollToRow, ensureRangeLoaded, getItemByRowIndex],
+    [
+      updateScrollAndRange,
+      scrollToRow,
+      ensureRangeLoaded,
+      getItemByRowIndex,
+      results,
+      cache,
+      scrollTop,
+      viewportHeight,
+      rowHeight,
+      rowCount,
+      pages,
+    ],
   );
 
   // ----- rendered items memo -----
@@ -243,7 +291,7 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
     });
   }, [start, end, scrollTop, rowHeight, renderRow, getItemByRowIndex]);
   const frozenViewport = useFrozenViewport({
-    dataVersion: dataResultsVersion,
+    dataVersion: displayedResultsVersion,
     scrollTop,
     renderedItems,
     viewportReady,

@@ -1,10 +1,20 @@
 use fswalk::NodeFileType;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
+#[derive(Debug, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(transparent)]
 /// state in the high 2 bits, type in the next 2bits, size in the low 60 bits
 pub struct StateTypeSize(u64);
+
+impl<'de> Deserialize<'de> for StateTypeSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u64::deserialize(deserializer)?;
+        if State::n((value >> 62) as u8).is_none() {
+            return Err(serde::de::Error::custom("invalid cached metadata state"));
+        }
+        Ok(Self(value))
+    }
+}
 
 impl StateTypeSize {
     pub fn none() -> Self {
@@ -57,6 +67,21 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserialization_rejects_invalid_state_without_changing_valid_bytes() {
+        let invalid = postcard::to_stdvec(&(3u64 << 62)).unwrap();
+        assert!(postcard::from_bytes::<StateTypeSize>(&invalid).is_err());
+        for state in [State::Unaccessible, State::Some, State::None] {
+            let original = StateTypeSize::new(state, NodeFileType::File, 123);
+            let bytes = postcard::to_stdvec(&original).unwrap();
+            assert_eq!(bytes, postcard::to_stdvec(&original.0).unwrap());
+            assert_eq!(
+                postcard::from_bytes::<StateTypeSize>(&bytes).unwrap(),
+                original
+            );
+        }
+    }
 
     #[test]
     fn test_type_and_size() {

@@ -24,6 +24,7 @@ type ColumnHeaderProps = {
   onResizeStart: (columnKey: ColumnKey) => (event: ReactMouseEvent<HTMLSpanElement>) => void;
   onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
   sortState: SortState;
+  isSorting?: boolean;
   onSortToggle: (sortKey: SortKey) => void;
   sortDisabled: boolean;
   sortDisabledTooltip: string | null;
@@ -32,7 +33,15 @@ type ColumnHeaderProps = {
 // Column widths are applied via CSS vars on container; no need to pass colWidths prop.
 export const ColumnHeader = forwardRef<HTMLDivElement, ColumnHeaderProps>(
   (
-    { onResizeStart, onContextMenu, sortState, onSortToggle, sortDisabled, sortDisabledTooltip },
+    {
+      onResizeStart,
+      onContextMenu,
+      sortState,
+      isSorting,
+      onSortToggle,
+      sortDisabled,
+      sortDisabledTooltip,
+    },
     ref,
   ) => {
     const { t } = useTranslation();
@@ -69,9 +78,15 @@ export const ColumnHeader = forwardRef<HTMLDivElement, ColumnHeaderProps>(
                   onClick={() => onSortToggle(sortKey)}
                   disabled={sortDisabled}
                   aria-pressed={isActive && !sortDisabled}
-                  title={title}
+                  title={isActive && isSorting ? t('sorting.inProgress') : title}
+                  aria-busy={(isActive && isSorting) || undefined}
                 >
                   <span className="sort-button__label">{label}</span>
+                  {isActive && isSorting && (
+                    <span className="sort-pending" aria-hidden="true">
+                      …
+                    </span>
+                  )}
                   <span className={indicatorClasses.join(' ')} aria-hidden="true" />
                 </button>
                 <span

@@ -53,7 +53,6 @@ export function useFilesTabState({
   const {
     handleInputChange: updateHistoryFromInput,
     navigate: navigateSearchHistory,
-    ensureTailValue: ensureHistoryBuffer,
     resetCursorToTail,
   } = useSearchHistory({ maxEntries: maxSearchHistoryEntries });
 
@@ -164,11 +163,8 @@ export function useFilesTabState({
         resetCursorToTail();
         return;
       }
-
-      ensureHistoryBuffer('');
-      queueSearch('', { immediate: true });
     },
-    [ensureHistoryBuffer, queueSearch, resetCursorToTail, setEventFilterQuery],
+    [resetCursorToTail],
   );
 
   const searchInputValue = activeTab === 'events' ? eventFilterQuery : searchQuery;

@@ -85,9 +85,11 @@ const normalizeIconUpdates = (payload: unknown): IconUpdatePayload[] => {
   if (!Array.isArray(payload)) {
     return [];
   }
-  return payload
-    .filter(isIconUpdateWirePayload)
-    .map((item) => ({ slabIndex: item.slabIndex as SlabIndex, icon: item.icon }));
+  return payload.filter(isIconUpdateWirePayload).map((item) => ({
+    slabIndex: item.slabIndex as SlabIndex,
+    icon: item.icon,
+    ...(typeof item.path === 'string' ? { path: item.path } : {}),
+  }));
 };
 
 export const initializeTauriEventRuntime = (): Promise<void> => {

@@ -7,7 +7,7 @@ type StateProps = {
   message?: React.ReactNode;
 };
 
-export type DisplayState = 'loading' | 'error' | 'empty' | 'results';
+export type DisplayState = 'restoring' | 'loading' | 'error' | 'empty' | 'results';
 type EmptyState = Exclude<DisplayState, 'results'>;
 
 type StateDisplayProps = {
@@ -35,6 +35,11 @@ export function StateDisplay({
   directoryQuery,
 }: StateDisplayProps): React.JSX.Element {
   const { t } = useTranslation();
+  if (state === 'restoring') {
+    return (
+      <State icon={<div className="spinner" />} title={t('statusBar.lifecycle.LoadingIndex')} />
+    );
+  }
   if (state === 'loading') {
     return <State icon={<div className="spinner" />} title={t('stateDisplay.loading')} />;
   }

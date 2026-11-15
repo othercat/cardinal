@@ -5,15 +5,29 @@ import { SEARCH_DEBOUNCE_MS } from '../constants';
 import {
   SearchStatusCode,
   type AppLifecycleStatus,
+  type MetadataProgress,
   type SearchResponsePayload,
+  type FileChangeBatch,
+  type SortedEdits,
 } from '../types/ipc';
+import { applyResultEdits } from '../utils/resultEdits';
+import type { SortKey } from '../types/sort';
 import type { SlabIndex } from '../types/slab';
+import { useLiveSearchRefresh } from './useLiveSearchRefresh';
 
 type SearchError = string | Error | null;
 
 type SearchState = {
+  metadata?: MetadataProgress;
+  pagedCount?: number;
+  viewId?: number;
+  incremental?: boolean;
+  sortedEdits?: SortedEdits;
+  changedIds?: readonly number[];
   results: SlabIndex[];
   resultsVersion: number;
+  queryVersion: number;
+  fileChanges: FileChangeBatch;
   scannedFiles: number;
   processedEvents: number;
   rescanErrors: number;
@@ -45,7 +59,12 @@ type QueueSearchOptions = {
 type SearchAction =
   | {
       type: 'STATUS_UPDATE';
-      payload: { scannedFiles: number; processedEvents: number; rescanErrors: number };
+      payload: {
+        scannedFiles: number;
+        processedEvents: number;
+        rescanErrors: number;
+        metadata?: MetadataProgress;
+      };
     }
   | { type: 'SEARCH_REQUEST'; payload: { immediate: boolean } }
   | { type: 'SEARCH_LOADING_DELAY' }
@@ -57,7 +76,14 @@ type SearchAction =
         directoryQuery: string;
         duration: number;
         count: number;
+        pagedCount?: number;
         highlightTerms: string[];
+        viewId?: number;
+        incremental?: boolean;
+        sortedEdits?: SortedEdits;
+        changedIds?: readonly number[];
+        background: boolean;
+        fileChanges: FileChangeBatch;
       };
     }
   | {
@@ -73,6 +99,8 @@ type SearchAction =
 const initialSearchState: SearchState = {
   results: [],
   resultsVersion: 0,
+  queryVersion: 0,
+  fileChanges: null,
   scannedFiles: 0,
   processedEvents: 0,
   rescanErrors: 0,
@@ -129,6 +157,7 @@ function reducer(state: SearchState, action: SearchAction): SearchState {
     case 'STATUS_UPDATE':
       return {
         ...state,
+        metadata: action.payload.metadata ?? state.metadata,
         scannedFiles: action.payload.scannedFiles,
         processedEvents: action.payload.processedEvents,
         rescanErrors: action.payload.rescanErrors,
@@ -145,17 +174,34 @@ function reducer(state: SearchState, action: SearchAction): SearchState {
         showLoadingUI: true,
       };
     case 'SEARCH_SUCCESS':
+      const sameResults =
+        action.payload.background &&
+        (state.results === action.payload.results ||
+          (state.results.length === action.payload.results.length &&
+            state.results.every((id, index) => id === action.payload.results[index])));
       return {
         ...state,
-        results: action.payload.results,
+        results: sameResults ? state.results : action.payload.results,
+        viewId: action.payload.viewId,
+        incremental: action.payload.incremental,
+        sortedEdits: action.payload.sortedEdits,
+        changedIds: action.payload.changedIds,
         resultsVersion: state.resultsVersion + 1,
+        queryVersion: state.queryVersion + (action.payload.background ? 0 : 1),
+        fileChanges: action.payload.fileChanges,
         currentQuery: action.payload.query,
         currentDirectoryQuery: action.payload.directoryQuery,
-        highlightTerms: action.payload.highlightTerms,
+        highlightTerms:
+          action.payload.background &&
+          state.highlightTerms.length === action.payload.highlightTerms.length &&
+          state.highlightTerms.every((term, index) => term === action.payload.highlightTerms[index])
+            ? state.highlightTerms
+            : action.payload.highlightTerms,
         showLoadingUI: false,
         initialFetchCompleted: true,
-        durationMs: action.payload.duration,
+        durationMs: action.payload.background ? state.durationMs : action.payload.duration,
         resultCount: action.payload.count,
+        pagedCount: action.payload.pagedCount,
         searchError: null,
       };
     case 'SEARCH_FAILURE':
@@ -178,6 +224,7 @@ function reducer(state: SearchState, action: SearchAction): SearchState {
       return {
         ...state,
         lifecycleState: action.payload.status,
+        metadata: action.payload.status === 'Initializing' ? undefined : state.metadata,
       };
     default:
       return state;
@@ -200,9 +247,16 @@ type UseFileSearchResult = {
   queueSearch: (query: string, options?: QueueSearchOptions) => void;
   queueDirectorySearch: (directoryQuery: string, options?: QueueSearchOptions) => void;
   queueDirectoryScopeOpen: (directoryScopeOpen: boolean) => void;
-  handleStatusUpdate: (scannedFiles: number, processedEvents: number, rescanErrors: number) => void;
+  handleStatusUpdate: (
+    scannedFiles: number,
+    processedEvents: number,
+    rescanErrors: number,
+    metadata?: MetadataProgress,
+  ) => void;
   setLifecycleState: (status: AppLifecycleStatus) => void;
   requestRescan: () => Promise<void>;
+  activeSortKey: MutableRefObject<SortKey | undefined>;
+  pendingSortRef: MutableRefObject<Promise<unknown> | null>;
 };
 
 export function useFileSearch(): UseFileSearchResult {
@@ -219,6 +273,10 @@ export function useFileSearch(): UseFileSearchResult {
   const hasInitialSearchRunRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadingDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const foregroundPendingRef = useRef(false);
+  const confirmedView = useRef<{ id?: number; nodes: SlabIndex[] }>({ nodes: [] });
+  const activeSortKey = useRef<SortKey>();
+  const pendingSortRef = useRef<Promise<unknown> | null>(null);
 
   const [searchParams, patchSearchParams] = useReducer(
     searchParamsReducer,
@@ -234,10 +292,15 @@ export function useFileSearch(): UseFileSearchResult {
   }, []);
 
   const handleStatusUpdate = useCallback(
-    (scannedFiles: number, processedEvents: number, rescanErrors: number) => {
+    (
+      scannedFiles: number,
+      processedEvents: number,
+      rescanErrors: number,
+      metadata?: MetadataProgress,
+    ) => {
       dispatch({
         type: 'STATUS_UPDATE',
-        payload: { scannedFiles, processedEvents, rescanErrors },
+        payload: { scannedFiles, processedEvents, rescanErrors, metadata },
       });
     },
     [],
@@ -269,96 +332,160 @@ export function useFileSearch(): UseFileSearchResult {
     cancelTimer(loadingDelayTimerRef);
   }, []);
 
-  const handleSearch = useCallback(async (overrides: Partial<SearchParams> = {}) => {
-    const nextSearch = { ...latestSearchRef.current, ...overrides };
-    latestSearchRef.current = nextSearch;
-    // the backend already has search version cancellation
-    // but we keep the check at frontend to make sure that
-    // the UI always reflects the latest request
-    const requestVersion = searchVersionRef.current + 1;
-    searchVersionRef.current = requestVersion;
+  const handleSearch = useCallback(
+    async (
+      overrides: Partial<SearchParams> = {},
+      background = false,
+      fileChanges: FileChangeBatch = null,
+    ) => {
+      if (background) {
+        // Finish the current sort before another live query can replace its
+        // source. User input always takes priority over automatic work.
+        while (pendingSortRef.current) await pendingSortRef.current.catch(() => {});
+        if (foregroundPendingRef.current || debounceTimerRef.current !== null) return false;
+      } else {
+        foregroundPendingRef.current = true;
+      }
+      const nextSearch = { ...latestSearchRef.current, ...overrides };
+      latestSearchRef.current = nextSearch;
+      // the backend already has search version cancellation
+      // but we keep the check at frontend to make sure that
+      // the UI always reflects the latest request
+      const requestVersion = searchVersionRef.current + 1;
+      searchVersionRef.current = requestVersion;
 
-    const { query, caseSensitive } = nextSearch;
-    const directoryQuery = activeDirectoryQuery(nextSearch);
-    const startTs = performance.now();
-    const isInitial = !hasInitialSearchRunRef.current;
+      const { query, caseSensitive } = nextSearch;
+      const directoryQuery = activeDirectoryQuery(nextSearch);
+      const startTs = performance.now();
+      const isInitial = !hasInitialSearchRunRef.current;
 
-    dispatch({ type: 'SEARCH_REQUEST', payload: { immediate: isInitial } });
-
-    if (!isInitial) {
-      cancelTimer(loadingDelayTimerRef);
-      loadingDelayTimerRef.current = setTimeout(() => {
-        dispatch({ type: 'SEARCH_LOADING_DELAY' });
-        loadingDelayTimerRef.current = null;
-      }, 150);
-    }
-
-    try {
-      const rawResults = await invoke<SearchResponsePayload>('search', {
-        query: searchParamOrNull(query),
-        directoryQuery: searchParamOrNull(directoryQuery),
-        options: {
-          caseInsensitive: !caseSensitive,
-        },
-      });
-
-      if (searchVersionRef.current !== requestVersion) {
-        return;
+      if (!background) {
+        dispatch({ type: 'SEARCH_REQUEST', payload: { immediate: isInitial } });
       }
 
-      if (rawResults.statusCode === SearchStatusCode.CANCELLED) {
+      if (!background && !isInitial) {
         cancelTimer(loadingDelayTimerRef);
-        dispatch({ type: 'SEARCH_CANCELLED' });
-        return;
+        loadingDelayTimerRef.current = setTimeout(() => {
+          dispatch({ type: 'SEARCH_LOADING_DELAY' });
+          loadingDelayTimerRef.current = null;
+        }, 150);
       }
 
-      const searchResults = rawResults.results as SlabIndex[];
-      const highlightTerms = Array.isArray(rawResults.highlights)
-        ? rawResults.highlights.filter((term): term is string => typeof term === 'string')
-        : [];
+      try {
+        const base = confirmedView.current;
+        const baseViewId = background ? base.id : undefined;
+        const rawResults = await invoke<SearchResponsePayload>('search', {
+          query: searchParamOrNull(query),
+          directoryQuery: searchParamOrNull(directoryQuery),
+          options: {
+            caseInsensitive: !caseSensitive,
+          },
+          ...(background ? { background: true } : {}),
+          ...(baseViewId === undefined ? {} : { baseViewId, sortKey: activeSortKey.current }),
+        });
 
-      cancelTimer(loadingDelayTimerRef);
+        // A user can click a sort header while this IPC request is running.
+        // Do not replace its source midway through the sort's completion.
+        if (background) {
+          while (pendingSortRef.current) await pendingSortRef.current.catch(() => {});
+        }
 
-      const endTs = performance.now();
-      const duration = endTs - startTs;
+        if (searchVersionRef.current !== requestVersion) {
+          return background ? false : undefined;
+        }
 
-      dispatch({
-        type: 'SEARCH_SUCCESS',
-        payload: {
-          results: searchResults,
-          query,
-          directoryQuery,
-          duration,
-          count: searchResults.length,
-          highlightTerms,
-        },
-      });
-    } catch (error) {
-      console.error('Search failed:', error);
+        if (rawResults.statusCode === SearchStatusCode.CANCELLED) {
+          if (!background) {
+            cancelTimer(loadingDelayTimerRef);
+            dispatch({ type: 'SEARCH_CANCELLED' });
+          }
+          return false;
+        }
 
-      if (searchVersionRef.current !== requestVersion) {
-        return;
+        if (background && rawResults.edits && rawResults.viewId === baseViewId) return true;
+        const searchResults =
+          rawResults.totalCount === undefined && rawResults.edits
+            ? applyResultEdits(base.nodes, rawResults.edits)
+            : (rawResults.results as SlabIndex[]);
+        confirmedView.current = { id: rawResults.viewId, nodes: searchResults };
+        // The index may have consumed events whose JS notification is still in transit.
+        if (rawResults.edits && rawResults.changedPaths?.length) {
+          fileChanges ??= [];
+          const notified = new Set(fileChanges.map(({ path }) => path));
+          fileChanges = [
+            ...fileChanges,
+            ...rawResults.changedPaths
+              .filter((path) => !notified.has(path))
+              .map((path) => ({
+                path,
+                flagBits: 0,
+                eventId: 0,
+                timestamp: 0,
+              })),
+          ];
+        } else if (background && rawResults.viewId !== undefined && !rawResults.edits) {
+          fileChanges = rawResults.changedIds ? [] : null;
+        }
+        const highlightTerms = Array.isArray(rawResults.highlights)
+          ? rawResults.highlights.filter((term): term is string => typeof term === 'string')
+          : [];
+
+        if (!background) cancelTimer(loadingDelayTimerRef);
+
+        const endTs = performance.now();
+        const duration = endTs - startTs;
+
+        dispatch({
+          type: 'SEARCH_SUCCESS',
+          payload: {
+            results: searchResults,
+            viewId: rawResults.viewId,
+            incremental: rawResults.incremental,
+            sortedEdits: rawResults.sorted,
+            changedIds: rawResults.changedIds,
+            query,
+            directoryQuery,
+            duration,
+            count: rawResults.totalCount ?? searchResults.length,
+            pagedCount: rawResults.totalCount,
+            highlightTerms,
+            background,
+            fileChanges,
+          },
+        });
+        return true;
+      } catch (error) {
+        console.error('Search failed:', error);
+
+        if (searchVersionRef.current !== requestVersion) {
+          return background ? false : undefined;
+        }
+
+        if (background) return false;
+        cancelTimer(loadingDelayTimerRef);
+
+        const endTs = performance.now();
+        const duration = endTs - startTs;
+
+        const normalisedError =
+          error instanceof Error ? error : error ? String(error) : 'An unknown error occurred.';
+
+        dispatch({
+          type: 'SEARCH_FAILURE',
+          payload: {
+            error: normalisedError,
+            duration,
+          },
+        });
+      } finally {
+        if (!background && searchVersionRef.current === requestVersion) {
+          foregroundPendingRef.current = false;
+        }
+        if (!background) hasInitialSearchRunRef.current = true;
       }
-
-      cancelTimer(loadingDelayTimerRef);
-
-      const endTs = performance.now();
-      const duration = endTs - startTs;
-
-      const normalisedError =
-        error instanceof Error ? error : error ? String(error) : 'An unknown error occurred.';
-
-      dispatch({
-        type: 'SEARCH_FAILURE',
-        payload: {
-          error: normalisedError,
-          duration,
-        },
-      });
-    } finally {
-      hasInitialSearchRunRef.current = true;
-    }
-  }, []);
+    },
+    [],
+  );
 
   const queueSearchParams = useCallback(
     (patch: Partial<SearchParams>, options?: QueueSearchOptions) => {
@@ -371,6 +498,7 @@ export function useFileSearch(): UseFileSearchResult {
       }
 
       debounceTimerRef.current = setTimeout(() => {
+        debounceTimerRef.current = null;
         options?.onSearchCommitted?.();
         handleSearch(patch);
       }, SEARCH_DEBOUNCE_MS);
@@ -419,6 +547,21 @@ export function useFileSearch(): UseFileSearchResult {
     await invoke('trigger_rescan');
   }, []);
 
+  const refreshSearch = useCallback(
+    (changes: FileChangeBatch) => handleSearch({}, true, changes),
+    [handleSearch],
+  );
+  useLiveSearchRefresh(
+    refreshSearch,
+    state.lifecycleState === 'Ready' || state.viewId !== undefined,
+    state.incremental !== false,
+    (state.lifecycleState === 'Ready'
+      ? 'ready'
+      : state.lifecycleState + '/' + state.scannedFiles + '/' + state.processedEvents) +
+      '/' +
+      (state.metadata?.revision ?? 0),
+  );
+
   return {
     state,
     searchParams,
@@ -429,5 +572,7 @@ export function useFileSearch(): UseFileSearchResult {
     handleStatusUpdate,
     setLifecycleState,
     requestRescan,
+    activeSortKey,
+    pendingSortRef,
   };
 }

@@ -1,5 +1,7 @@
 use crate::{
-    commands::{NodeInfoRequest, SearchJob, WatchConfigUpdate},
+    commands::{
+        NodeInfoRequest, SearchJob, SearchResponse, SortJob, SortedEdits, WatchConfigUpdate,
+    },
     lifecycle::{APP_QUIT, AppLifecycleState, load_app_state, update_app_state},
     search_activity,
     window_controls::is_main_window_foreground,
@@ -12,13 +14,17 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rayon::spawn;
 use search_cache::{
-    HandleFSEError, SearchCache, SearchOptions, SearchResultNode, SlabIndex, WalkData,
+    EventReplay, InitialScan, LiveSearch, SearchCache, SearchOptions, SearchResultNode, SlabIndex,
+    SortDirection, SortKey, VIEW_PAGE_SIZE, WalkData,
 };
 use search_cancel::CancellationToken;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter};
@@ -30,11 +36,14 @@ pub struct StatusBarUpdate {
     pub scanned_files: usize,
     pub processed_events: usize,
     pub rescan_errors: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<MetadataProgress>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct IconPayload {
+    pub path: String,
     pub slab_index: SlabIndex,
     pub icon: String,
 }
@@ -44,11 +53,69 @@ pub struct BackgroundLoopChannels {
     pub update_window_state_rx: Receiver<()>,
     pub search_rx: Receiver<SearchJob>,
     pub node_info_rx: Receiver<NodeInfoRequest>,
+    pub sort_rx: Receiver<SortJob>,
     pub icon_viewport_rx: Receiver<(u64, Vec<SlabIndex>)>,
     pub rescan_rx: Receiver<CancellationToken>,
     pub watch_config_rx: Receiver<WatchConfigUpdate>,
     pub icon_update_tx: Sender<IconPayload>,
 }
+
+#[derive(Clone)]
+struct SortedOrder {
+    missing: usize,
+    view: u64,
+    key: SortKey,
+    ids: Arc<Vec<SlabIndex>>,
+}
+
+#[derive(Default)]
+struct PublishedOrders {
+    latest: Option<SortedOrder>,
+    previous: Option<SortedOrder>,
+}
+
+impl PublishedOrders {
+    fn get(&self, view: u64, key: SortKey) -> Option<&SortedOrder> {
+        [&self.latest, &self.previous]
+            .into_iter()
+            .filter_map(Option::as_ref)
+            .find(|o| o.view == view && o.key == key)
+    }
+
+    fn publish(&mut self, order: SortedOrder) {
+        self.previous = self.latest.replace(order);
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct MetadataProgress {
+    processed: usize,
+    total: usize,
+    revision: u64,
+}
+
+struct Hydration {
+    cancel: Arc<AtomicBool>,
+    pending: Option<search_cache::MetadataPlanner>,
+    progress: MetadataProgress,
+    emitted: Instant,
+    published: Instant,
+}
+
+impl Drop for Hydration {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+// Slow File Provider volumes must not occupy the interactive sort / event workers.
+static METADATA_WORKERS: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 6)))
+        .thread_name(|i| format!("cardinal-attributes-{i}"))
+        .build()
+        .expect("metadata workers")
+});
 
 pub fn reset_status_bar(app_handle: &AppHandle) {
     app_handle
@@ -58,6 +125,7 @@ pub fn reset_status_bar(app_handle: &AppHandle) {
                 scanned_files: 0,
                 processed_events: 0,
                 rescan_errors: 0,
+                metadata: None,
             },
         )
         .unwrap();
@@ -84,6 +152,7 @@ pub fn emit_status_bar_update(
                     scanned_files,
                     processed_events,
                     rescan_errors,
+                    metadata: None,
                 },
             )
             .unwrap();
@@ -101,7 +170,7 @@ fn handle_watch_config_update(
     fse_latency_secs: f64,
     history_ready: &mut bool,
     processed_events: &mut usize,
-) {
+) -> bool {
     info!("Received watch config update: {:?}", update);
     let WatchConfigUpdate {
         watch_root: next_watch_root,
@@ -168,6 +237,7 @@ fn handle_watch_config_update(
         )
         .1
     };
+    !cache.is_noop()
 }
 
 struct EventSnapshot {
@@ -191,8 +261,9 @@ fn handle_flush_tick(
     cache: &mut SearchCache,
     db_path: &Path,
     hide_flush_remaining_ticks: &mut u8,
+    complete_index: bool,
 ) {
-    if load_app_state() != AppLifecycleState::Ready {
+    if !complete_index || cache.is_noop() {
         return;
     }
     let mut flush_search_cache = FlushSearchCache { cache, db_path };
@@ -207,7 +278,7 @@ fn handle_flush_tick(
     }
 }
 
-fn handle_event_watcher_events(
+fn publish_applied_events(
     app_handle: &AppHandle,
     cache: &mut SearchCache,
     events: Vec<FsEvent>,
@@ -216,18 +287,10 @@ fn handle_event_watcher_events(
 ) {
     *processed_events += events.len();
 
-    emit_status_bar_update(
-        app_handle,
-        cache.get_total_files(),
-        *processed_events,
-        cache.rescan_count() as usize,
-    );
-
     let mut snapshots = Vec::with_capacity(events.len());
     for event in events.iter() {
-        if event.flag == EventFlag::HistoryDone {
+        if event.flag.contains(EventFlag::HistoryDone) {
             *history_ready = true;
-            update_app_state(app_handle, AppLifecycleState::Ready);
         } else if *history_ready {
             snapshots.push(EventSnapshot {
                 path: event.path.clone(),
@@ -238,19 +301,17 @@ fn handle_event_watcher_events(
         }
     }
 
-    let handle_result = cache.handle_fs_events(events);
-    if let Err(HandleFSEError::Rescan) = handle_result {
-        info!("!!!!!!!!!! Rescan triggered !!!!!!!!");
-        emit_status_bar_update(
-            app_handle,
-            cache.get_total_files(),
-            *processed_events,
-            cache.rescan_count() as usize,
-        );
-    }
-
-    if *history_ready && !snapshots.is_empty() {
-        forward_new_events(app_handle, &snapshots);
+    emit_status_bar_update(
+        app_handle,
+        cache.get_total_files(),
+        *processed_events,
+        cache.rescan_count() as usize,
+    );
+    if *history_ready {
+        update_app_state(app_handle, AppLifecycleState::Ready);
+        if !snapshots.is_empty() {
+            forward_new_events(app_handle, &snapshots);
+        }
     }
 }
 
@@ -275,26 +336,28 @@ fn handle_icon_viewport_update(
     icon_jobs
         .into_iter()
         .map(|(slab_index, path)| (slab_index, path.to_string_lossy().into_owned()))
-        .filter(|(_, path)| {
-            // OneDrive
-            // iCloud Drive
-            // Google Drive
-            // Dropbox
-            !path.contains("OneDrive")
-                && !path.contains("com~apple~CloudDocs")
-                && !path.contains("Google Drive")
-                && !path.contains("Dropbox")
-        })
         .for_each(|(slab_index, path)| {
             let icon_update_tx = icon_update_tx.clone();
             spawn(move || {
-                if let Some(icon) = fs_icon::icon_of_path_ql(&path).map(|data| {
+                let cloud = ["OneDrive", "com~apple~CloudDocs", "Google Drive", "Dropbox"]
+                    .iter()
+                    .any(|marker| path.contains(marker));
+                let data = if cloud {
+                    fs_icon::icon_of_path_ns(&path)
+                } else {
+                    fs_icon::icon_of_path(&path)
+                };
+                if let Some(icon) = data.map(|data| {
                     format!(
                         "data:image/png;base64,{}",
                         general_purpose::STANDARD.encode(&data)
                     )
                 }) {
-                    let _ = icon_update_tx.send(IconPayload { slab_index, icon });
+                    let _ = icon_update_tx.send(IconPayload {
+                        slab_index,
+                        path,
+                        icon,
+                    });
                 }
             });
         });
@@ -305,6 +368,7 @@ pub fn run_background_event_loop(
     app_handle: &AppHandle,
     mut cache: SearchCache,
     mut event_watcher: EventWatcher,
+    mut initial_scan: Option<InitialScan>,
     channels: BackgroundLoopChannels,
     mut watch_root: String,
     fse_latency_secs: f64,
@@ -315,25 +379,83 @@ pub fn run_background_event_loop(
         update_window_state_rx,
         search_rx,
         node_info_rx,
+        sort_rx,
         icon_viewport_rx,
         rescan_rx,
         watch_config_rx,
         icon_update_tx,
     } = channels;
+    let mut live = LiveSearch::default();
+    let (hydrated_tx, hydrated_rx) = crossbeam_channel::bounded(4);
+    let sorted_order = Arc::new(Mutex::new(PublishedOrders::default()));
+    let mut hydration_epoch = 0u64;
+    let mut metadata_revision = 0u64;
+    let mut hydration: Option<Hydration> = None;
+    let no_plan = crossbeam_channel::never();
+    let mut plan_timer = no_plan.clone();
     let mut processed_events = 0usize;
     let mut history_ready = load_app_state() == AppLifecycleState::Ready;
+    // A loaded snapshot is a complete baseline even while its history is
+    // replaying. A cold scan must finish before it may replace that snapshot.
+    let mut complete_index = initial_scan.is_none() && !cache.is_noop();
 
     let mut window_is_foreground = true;
     let mut hide_flush_remaining_ticks: u8 = 0;
     // Hide flush is polled on a 10s ticker; idle flush shares the same tick.
     let flush_ticker = crossbeam_channel::tick(Duration::from_secs(10));
 
+    let idle_scan = crossbeam_channel::never();
+    let no_events = crossbeam_channel::never();
+    let no_observations = crossbeam_channel::never();
+    let mut replay: Option<(EventReplay, Vec<FsEvent>)> = None;
     loop {
+        complete_index |= load_app_state() == AppLifecycleState::Ready;
+        if APP_QUIT.load(Ordering::Relaxed) && !complete_index {
+            return;
+        }
+        let scan_rx = initial_scan
+            .as_ref()
+            .map(InitialScan::batches)
+            .unwrap_or(&idle_scan);
+        let events_rx: &Receiver<_> = if replay.is_some() {
+            &no_events
+        } else {
+            &event_watcher
+        };
+        let observations = replay
+            .as_ref()
+            .map(|(r, _)| r.observations())
+            .unwrap_or(&no_observations);
         crossbeam_channel::select! {
+            recv(scan_rx) -> batch => {
+                let scan = initial_scan.as_mut().expect("active scan");
+                if scan.cancelled() {
+                    initial_scan = None;
+                    // A queued rescan/config change replaces this incomplete tree.
+                    continue;
+                }
+                let done = scan.apply(&mut cache, batch.expect("scan channel closed"));
+                emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
+                if done {
+                    initial_scan = None;
+                    complete_index = true;
+                    update_app_state(app_handle, AppLifecycleState::Updating);
+                    event_watcher = EventWatcher::spawn(
+                        watch_root.clone(),
+                        cache.last_event_id(),
+                        fse_latency_secs,
+                        cache.ignore_paths(),
+                        cache.include_paths(),
+                    )
+                    .1;
+                }
+            }
             recv(finish_rx) -> tx => {
-                let tx = tx.expect("Finish channel closed");
-                // Only save cache if it's not a noop (i.e. the initial walk wasn't cancelled), otherwise send None to avoid writing an empty cache file
-                tx.send((!cache.is_noop()).then_some(cache)).expect("Failed to send cache");
+                if let Ok(tx) = tx {
+                    // Partial event observations retain the last complete batch's
+                    // cursor, so they can be saved and replayed after restart.
+                    let _ = tx.send((complete_index && !cache.is_noop()).then_some(cache));
+                }
                 return;
             }
             recv(update_window_state_rx) -> _ => {
@@ -352,27 +474,321 @@ pub fn run_background_event_loop(
                     &mut cache,
                     &db_path,
                     &mut hide_flush_remaining_ticks,
+                    complete_index,
                 );
             }
             recv(search_rx) -> job => {
                 let SearchJob {
                     query,
                     options,
+                    base_view_id,
+                    sort_key,
                     cancellation_token,
-                    result_tx
+                    result_tx,
                 } = job.expect("Search channel closed");
                 let opts = SearchOptions::from(options);
-                let payload = cache.search_query_with_options(query, opts, cancellation_token);
-                result_tx.send(payload).expect("Failed to send result");
+                let payload = live
+                    .search_windowed(&mut cache, query, opts, base_view_id, cancellation_token)
+                    .map(|view| {
+                        let mut cached = sorted_order.lock();
+                        let mut sorted = None;
+                        if let Some(order) = cached.latest.as_ref()
+                            && order.view != view.view_id
+                            && order.missing == 0
+                            && Some(order.key) == sort_key
+                            && Some(order.view) == base_view_id
+                            && let Some((dirty, members)) = live.delta_since(order.view)
+                        {
+                            // Keep the last published order readable until its replacement
+                            // is actually visible. A page request can cross a search reply.
+                            let mut next = order.clone();
+                            if let Some(edits) = cache.patch_sorted_order(
+                                Arc::make_mut(&mut next.ids),
+                                next.key,
+                                dirty,
+                                members,
+                                cancellation_token,
+                            ) {
+                                sorted = Some(SortedEdits {
+                                    base_view_id: next.view,
+                                    key: next.key,
+                                    edits,
+                                });
+                                next.view = view.view_id;
+                                cached.publish(next);
+                            }
+                        }
+                        SearchResponse { view, sorted }
+                    });
+                let _ = result_tx.send(payload);
+            }
+            recv(plan_timer) -> _ => {
+                plan_timer = no_plan.clone();
+                if let Some(work) = &mut hydration
+                    && let Some(planner) = &mut work.pending
+                {
+                    let Some(plan) = planner.advance(&cache) else {
+                        plan_timer = crossbeam_channel::after(Duration::from_millis(1));
+                        continue;
+                    };
+                    work.pending = None;
+                    let cancel = Arc::clone(&work.cancel);
+                    let tx = hydrated_tx.clone();
+                    let epoch = hydration_epoch;
+                    METADATA_WORKERS.spawn(move || {
+                        plan.run(
+                            || APP_QUIT.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed),
+                            |rows| {
+                                let _ = tx.send((epoch, Some(rows)));
+                            },
+                        );
+                        let _ = tx.send((epoch, None));
+                    });
+                }
+            }
+            recv(hydrated_rx) -> next => {
+                if let Ok((epoch, rows)) = next
+                    && epoch == hydration_epoch
+                    && let Some(work) = &mut hydration
+                {
+                    let done = rows.is_none();
+                    if let Some(rows) = rows {
+                        work.progress.processed += rows.len();
+                        cache.remember_hydrated_rows(rows);
+                    }
+                    if done || work.emitted.elapsed() >= Duration::from_millis(500) {
+                        if done || work.published.elapsed() >= Duration::from_secs(4) {
+                            cache.publish_hydrated_metadata();
+                            metadata_revision += 1;
+                            work.progress.revision = metadata_revision;
+                            work.published = Instant::now();
+                        }
+                        if done {
+                            work.progress.processed = work.progress.total;
+                        }
+                        let _ = app_handle.emit(
+                            "status_bar_update",
+                            StatusBarUpdate {
+                                scanned_files: cache.get_total_files(),
+                                processed_events,
+                                rescan_errors: cache.rescan_count() as usize,
+                                metadata: Some(work.progress),
+                            },
+                        );
+                        work.emitted = Instant::now();
+                    }
+                    if done {
+                        hydration = None;
+                    }
+                }
             }
             recv(node_info_rx) -> request => {
-                let request = request.expect("Node info channel closed");
-                let NodeInfoRequest {
+                match request.expect("Node info channel closed") {
+                    NodeInfoRequest::Rows {
+                        slab_indices,
+                        response_tx,
+                    } => {
+                        let _ = response_tx.send(cache.expand_file_nodes(&slab_indices));
+                    }
+                    NodeInfoRequest::Page {
+                        view_id,
+                        sort,
+                        offset,
+                        limit,
+                        locate,
+                        response_tx,
+                    } => {
+                        let descending = sort.is_some_and(|s| s.direction == SortDirection::Desc);
+                        let stored = sorted_order.lock();
+                        let result = if let Some(order) =
+                            sort.and_then(|s| stored.get(view_id, s.key))
+                        {
+                            Some(view_page(
+                                &order.ids,
+                                order.missing,
+                                descending,
+                                offset,
+                                limit,
+                                locate.as_deref(),
+                            ))
+                        } else if let Some(raw) = live.nodes(view_id) {
+                            match sort {
+                                None => {
+                                    Some(view_page(raw, 0, false, offset, limit, locate.as_deref()))
+                                }
+                                Some(sort)
+                                    if sort.key == SortKey::Filename && live.name_ordered() =>
+                                {
+                                    Some(match locate {
+                                        None => live
+                                            .filename_page(&mut cache, offset, limit, descending)
+                                            .into_iter()
+                                            .map(|id| id.get() as u32)
+                                            .collect(),
+                                        Some(ids) => {
+                                            live.filename_positions(&mut cache, &ids, descending)
+                                        }
+                                    })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let _ = response_tx.send(result);
+                    }
+                }
+            }
+            recv(sort_rx) -> job => {
+                let SortJob {
+                    view_id,
+                    paged,
                     slab_indices,
+                    sort,
+                    cancellation_token,
                     response_tx,
-                } = request;
-                let node_info_results = cache.expand_file_nodes(&slab_indices);
-                let _ = response_tx.send(node_info_results);
+                } = job.expect("Sort channel closed");
+                let source = match view_id {
+                    Some(id) => live.nodes(id),
+                    None => Some(slab_indices.as_slice()),
+                };
+                let Some(ids) = source else {
+                    let _ = response_tx.send(None);
+                    continue;
+                };
+                if paged && sort.key == SortKey::Filename && live.name_ordered() {
+                    let _ = response_tx.send(Some(live.filename_page(
+                        &mut cache,
+                        0,
+                        VIEW_PAGE_SIZE,
+                        sort.direction == SortDirection::Desc,
+                    )));
+                    continue;
+                }
+                let head = move |order: &SortedOrder| -> Vec<SlabIndex> {
+                    view_page(
+                        &order.ids,
+                        order.missing,
+                        sort.direction == SortDirection::Desc,
+                        0,
+                        VIEW_PAGE_SIZE,
+                        None,
+                    )
+                    .into_iter()
+                    .map(|id| SlabIndex::new(id as usize))
+                    .collect()
+                };
+                if paged {
+                    if let Some(cached) =
+                        view_id.and_then(|v| sorted_order.lock().get(v, sort.key).cloned())
+                    {
+                        let _ = response_tx.send(Some(head(&cached)));
+                        continue;
+                    }
+                    if sort.key == SortKey::FullPath
+                        && ids.len().saturating_mul(8) >= cache.get_total_files()
+                    {
+                        let page = cache.path_order(ids, cancellation_token).and_then(|ids| {
+                            let order = SortedOrder {
+                                view: view_id?,
+                                key: sort.key,
+                                missing: 0,
+                                ids: Arc::new(ids),
+                            };
+                            let page = head(&order);
+                            sorted_order.lock().publish(order);
+                            Some(page)
+                        });
+                        let _ = response_tx.send(page);
+                        continue;
+                    }
+                    let numeric = matches!(sort.key, SortKey::Size | SortKey::Mtime | SortKey::Ctime);
+                    let ranked = numeric
+                        .then(|| {
+                            cache.indexed_numeric_order(
+                                ids,
+                                sort.key,
+                                live.name_ordered(),
+                                cancellation_token,
+                            )
+                        })
+                        .flatten();
+                    let text = if numeric {
+                        None
+                    } else {
+                        cache.prepare_sort(ids, sort.key, cancellation_token)
+                    };
+                    let missing = ranked.as_ref().map_or(0, |r| r.missing);
+                    let to_hydrate = ranked.as_ref().map_or(0, |r| r.to_hydrate);
+                    if to_hydrate > 0 && hydration.is_none() {
+                        hydration_epoch += 1;
+                        let progress = MetadataProgress {
+                            processed: 0,
+                            total: to_hydrate,
+                            revision: metadata_revision,
+                        };
+                        let _ = app_handle.emit(
+                            "status_bar_update",
+                            StatusBarUpdate {
+                                scanned_files: cache.get_total_files(),
+                                processed_events,
+                                rescan_errors: cache.rescan_count() as usize,
+                                metadata: Some(progress),
+                            },
+                        );
+                        hydration = Some(Hydration {
+                            cancel: Arc::new(AtomicBool::new(false)),
+                            pending: Some(search_cache::MetadataPlanner::new(ids)),
+                            progress,
+                            emitted: Instant::now(),
+                            published: Instant::now(),
+                        });
+                        plan_timer = crossbeam_channel::after(Duration::from_millis(120));
+                    }
+                    let stored = Arc::clone(&sorted_order);
+                    spawn(move || {
+                        let ids = if let Some(ranked) = ranked {
+                            ranked.sort(cancellation_token)
+                        } else {
+                            text.and_then(|s| s.sort(SortDirection::Asc, cancellation_token))
+                        };
+                        let page = ids.and_then(|ids| {
+                            let order = SortedOrder {
+                                view: view_id?,
+                                key: sort.key,
+                                missing,
+                                ids: Arc::new(ids),
+                            };
+                            let mut guard = stored.lock();
+                            cancellation_token.is_cancelled()?;
+                            let page = head(&order);
+                            guard.publish(order);
+                            Some(page)
+                        });
+                        let _ = response_tx.send(page);
+                    });
+                } else {
+                    let snapshot = cache.prepare_sort(ids, sort.key, cancellation_token);
+                    let stored = Arc::clone(&sorted_order);
+                    spawn(move || {
+                        let result =
+                            snapshot.and_then(|s| s.sort(sort.direction, cancellation_token));
+                        if let (Some(view), Some(ids)) = (view_id, &result)
+                            && sort.direction == SortDirection::Asc
+                        {
+                            let mut order = stored.lock();
+                            if cancellation_token.is_cancelled().is_some() {
+                                order.publish(SortedOrder {
+                                    view,
+                                    key: sort.key,
+                                    missing: 0,
+                                    ids: Arc::new(ids.clone()),
+                                });
+                            }
+                        }
+                        let _ = response_tx.send(result);
+                    });
+                }
             }
             recv(icon_viewport_rx) -> update => {
                 let update = update.expect("Icon viewport channel closed");
@@ -380,8 +796,12 @@ pub fn run_background_event_loop(
             }
             recv(rescan_rx) -> request => {
                 let scan_cancellation_token = request.expect("Rescan channel closed");
+                initial_scan = None;
+                replay = None;
+                hydration_epoch += 1;
+                hydration = None;
                 info!("Manual rescan requested");
-                perform_rescan(
+                complete_index |= perform_rescan(
                     app_handle,
                     &mut cache,
                     &mut event_watcher,
@@ -393,8 +813,12 @@ pub fn run_background_event_loop(
                 );
             }
             recv(watch_config_rx) -> update => {
+                initial_scan = None;
+                replay = None;
+                hydration_epoch += 1;
+                hydration = None;
                 let next_update = update.expect("Watch config channel closed");
-                handle_watch_config_update(
+                complete_index = handle_watch_config_update(
                     app_handle,
                     next_update,
                     &mut cache,
@@ -405,18 +829,72 @@ pub fn run_background_event_loop(
                     &mut processed_events,
                 );
             }
-            recv(event_watcher) -> events => {
+            recv(observations) -> observation => {
+                let Ok(observation) = observation else {
+                    // The worker can be cancelled while quitting. Keep the last complete cursor.
+                    replay = None;
+                    continue;
+                };
+                if cache.apply_observation(observation) {
+                    let (_, events) = replay.take().expect("active event batch");
+                    publish_applied_events(
+                        app_handle,
+                        &mut cache,
+                        events,
+                        &mut history_ready,
+                        &mut processed_events,
+                    );
+                }
+            }
+            recv(events_rx) -> events => {
                 let events = events.expect("Event stream closed");
-                handle_event_watcher_events(
-                    app_handle,
-                    &mut cache,
-                    events,
-                    &mut history_ready,
-                    &mut processed_events,
-                );
+                match cache.plan_events(&events) {
+                    Ok(plan) => replay = Some((plan.start(&APP_QUIT), events)),
+                    Err(_) => {
+                        hydration_epoch += 1;
+                        hydration = None;
+                        complete_index |= perform_rescan(
+                            app_handle,
+                            &mut cache,
+                            &mut event_watcher,
+                            &watch_root,
+                            fse_latency_secs,
+                            &mut history_ready,
+                            &mut processed_events,
+                            CancellationToken::new_scan(),
+                        );
+                    }
+                }
             }
         }
     }
+}
+
+fn view_page(
+    ids: &[SlabIndex],
+    missing: usize,
+    desc: bool,
+    offset: usize,
+    limit: usize,
+    locate: Option<&[SlabIndex]>,
+) -> Vec<u32> {
+    let known = ids.len().saturating_sub(missing);
+    // Rows waiting for an attribute follow all known values in either direction.
+    let position = |i| if desc && i < known { known - 1 - i } else { i };
+    if let Some(wanted) = locate {
+        let mut positions: std::collections::HashMap<_, _> =
+            wanted.iter().map(|&id| (id, u32::MAX)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(pos) = positions.get_mut(id) {
+                *pos = position(i) as u32;
+            }
+        }
+        return wanted.iter().map(|id| positions[id]).collect();
+    }
+    let a = offset.min(ids.len());
+    (a..a + limit.min(ids.len() - a))
+        .map(|i| ids[position(i)].get() as u32)
+        .collect()
 }
 
 pub(crate) fn build_search_cache(
@@ -427,7 +905,7 @@ pub(crate) fn build_search_cache(
     scan_cancellation_token: CancellationToken,
 ) -> Option<SearchCache> {
     let path = Path::new(watch_root);
-    let walk_data = WalkData::new(path, ignore_paths, include_paths, false, move || {
+    let walk_data = WalkData::new(path, ignore_paths, include_paths, true, move || {
         APP_QUIT.load(Ordering::Relaxed) || scan_cancellation_token.is_cancelled().is_none()
     });
     let walking_done = AtomicBool::new(false);
@@ -458,10 +936,10 @@ fn perform_rescan(
     history_ready: &mut bool,
     processed_events: &mut usize,
     scan_cancellation_token: CancellationToken,
-) {
+) -> bool {
     if scan_cancellation_token.is_cancelled().is_none() {
         info!("Skipping stale rescan request");
-        return;
+        return false;
     }
 
     *event_watcher = EventWatcher::noop();
@@ -509,6 +987,7 @@ fn perform_rescan(
         )
         .1
     };
+    !stopped
 }
 
 fn unix_timestamp_now() -> i64 {
@@ -562,7 +1041,7 @@ impl FlushSnapshot for FlushSearchCache<'_> {
 }
 
 /// This function should be called periodically to check if a flush is needed.
-/// Returns true if a flush was performed (either hide or idle).
+/// Returns true only when a snapshot was saved successfully.
 fn start_flush_checks<F, I, C>(
     is_foreground: F,
     is_idle: I,
@@ -586,40 +1065,51 @@ where
     };
     let hide_flush = hide_flush && !is_foreground();
 
-    if hide_flush {
-        let label = "hide_flush";
-        match cache.flush_snapshot_to_file() {
-            Ok(()) => info!(
-                "Cache flushed successfully ({label}) to {:?}",
-                cache.db_path()
-            ),
-            Err(e) => error!(
-                "Cache flush failed ({label}) to {:?}: {e:?}",
-                cache.db_path()
-            ),
-        }
-        true
+    let label = if hide_flush {
+        "hide_flush"
     } else if idle_flush {
-        let label = "idle_flush";
-        match cache.flush_snapshot_to_file() {
-            Ok(()) => info!(
+        "idle_flush"
+    } else {
+        return false;
+    };
+    match cache.flush_snapshot_to_file() {
+        Ok(()) => {
+            info!(
                 "Cache flushed successfully ({label}) to {:?}",
                 cache.db_path()
-            ),
-            Err(e) => error!(
+            );
+            true
+        }
+        Err(e) => {
+            error!(
                 "Cache flush failed ({label}) to {:?}: {e:?}",
                 cache.db_path()
-            ),
+            );
+            if hide_flush {
+                *hide_flush_remaining_ticks = 1;
+            }
+            false
         }
-        true
-    } else {
-        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_pages_keep_unknown_values_last_in_both_directions() {
+        let ids = [13, 7, 8, 4, 5].map(SlabIndex::new);
+        assert_eq!(view_page(&ids, 2, false, 0, 5, None), [13, 7, 8, 4, 5]);
+        assert_eq!(view_page(&ids, 2, true, 0, 5, None), [8, 7, 13, 4, 5]);
+        assert_eq!(view_page(&ids, 2, true, 2, 2, None), [13, 4]);
+        let locate = [4, 8, 13, 99].map(SlabIndex::new);
+        assert_eq!(
+            view_page(&ids, 2, true, 0, 0, Some(&locate)),
+            [3, 0, 2, u32::MAX]
+        );
+        assert!(view_page(&ids, 2, true, usize::MAX, usize::MAX, None).is_empty());
+    }
 
     #[derive(Default)]
     struct FakeCache {
@@ -732,20 +1222,14 @@ mod tests {
         let mut cache = FakeCacheErr;
         let mut pending = 1;
 
-        // Hide flush attempt fails; the hide flush logic treats the flush as
-        // satisfying the idle window (it bumps the idle timestamp even on errors).
+        // A failed checkpoint keeps the idle deadline and retries the hide save.
         let flushed = start_flush_checks(|| false, || true, &mut cache, &mut pending);
 
-        // pending should be consumed (counter is decremented), but since flush failed,
-        // idle window should still be considered idle and search_idles() should be true.
         assert!(
-            flushed,
-            "failed hide flush should still satisfy idle window (bumped)"
+            !flushed,
+            "failed hide flush must not advance the idle window"
         );
-        assert_eq!(
-            pending, 0,
-            "pending should be consumed even on flush failure"
-        );
+        assert_eq!(pending, 1, "failed hide save should retry on the next tick");
     }
 
     // ===== Tests for foreground -> background transitions =====
@@ -1024,20 +1508,19 @@ mod tests {
     }
 
     #[test]
-    fn error_during_hide_flush_still_consumes_pending() {
-        // Hide flush fails, but pending should still be consumed
-
+    fn error_during_hide_flush_retries_until_success() {
         let mut cache = FakeCacheErr;
         let mut pending = 1;
 
         let flushed = start_flush_checks(|| false, || false, &mut cache, &mut pending);
-        assert!(flushed, "hide flush was attempted");
-        assert_eq!(pending, 0, "pending consumed even on flush error");
+        assert!(!flushed, "failed hide flush must not count as saved");
+        assert_eq!(pending, 1, "failed hide flush remains pending");
 
-        // Should not re-attempt flush on next tick unless pending is set again
+        let mut cache = FakeCache::default();
         let flushed = start_flush_checks(|| false, || false, &mut cache, &mut pending);
-        assert!(!flushed, "no idle flush on retry");
-        assert_eq!(pending, 0, "stays at 0");
+        assert!(flushed, "next tick retries and saves after recovery");
+        assert_eq!(cache.flushes, 1);
+        assert_eq!(pending, 0, "successful retry consumes pending");
     }
 
     #[test]
@@ -1085,16 +1568,13 @@ mod tests {
     }
 
     #[test]
-    fn idle_flush_error_still_advances_idle_window() {
-        // Idle flush fails, but idle window should still be advanced
-
+    fn idle_flush_error_preserves_idle_window() {
         let mut cache = FakeCacheErr;
         let mut pending = 0;
 
         let flushed = start_flush_checks(|| true, || true, &mut cache, &mut pending);
 
-        // Even though flush failed, idle window should be advanced
-        assert!(flushed, "idle window should be advanced even on error");
+        assert!(!flushed, "failed save must preserve the idle deadline");
     }
 
     #[test]
@@ -1210,7 +1690,7 @@ mod tests {
         let mut pending = 0;
 
         let flushed = start_flush_checks(|| true, || true, &mut cache_err, &mut pending);
-        assert!(flushed, "idle advanced even on error");
+        assert!(!flushed, "failed idle save must preserve its deadline");
 
         // Time passes again
 

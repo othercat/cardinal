@@ -1,9 +1,13 @@
-use rayon::{iter::ParallelBridge, prelude::ParallelIterator};
+#[cfg(target_os = "macos")]
+mod darwin;
+
+use rayon::{iter::ParallelBridge, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
+    ffi::OsString,
     fs::{self, Metadata},
-    io::{Error, ErrorKind},
+    io::{self, Error, ErrorKind},
     num::NonZeroU64,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -25,6 +29,65 @@ pub struct NodeMetadata {
     pub size: u64,
     pub ctime: Option<NonZeroU64>,
     pub mtime: Option<NonZeroU64>,
+}
+
+#[derive(Debug)]
+pub struct DirectoryMetadataEntry {
+    pub name: OsString,
+    pub metadata: Option<NodeMetadata>,
+}
+
+/// Read only the immediate entries of a directory, including metadata about
+/// symlinks themselves. This does not recurse, apply ignore rules, or guarantee
+/// ordering. Darwin collects the attributes in directory batches; unsupported
+/// volumes and missing attributes use the normal lstat fallback.
+///
+/// `Ok(None)` means cancellation. Unreadable entries retain their names with
+/// `metadata: None`; an error means the directory itself could not be enumerated.
+pub fn read_directory_metadata(
+    path: &Path,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Option<Vec<DirectoryMetadataEntry>>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(entries) = darwin::read_directory(path, true, &cancelled) {
+        let Some(entries) = entries else {
+            return Ok(None);
+        };
+        let mut result = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if cancelled() {
+                return Ok(None);
+            }
+            let metadata = entry
+                .metadata
+                .or_else(|| metadata_of_path(&path.join(&entry.name)).map(NodeMetadata::from));
+            result.push(DirectoryMetadataEntry {
+                name: entry.name,
+                metadata,
+            });
+        }
+        return Ok(Some(result));
+    }
+    // The Darwin fast path opens with O_DIRECTORY | O_NOFOLLOW. Only the
+    // fallback needs a separate type check before using std::fs::read_dir.
+    if !path.symlink_metadata()?.is_dir() {
+        return Err(io::Error::new(ErrorKind::NotADirectory, "not a directory"));
+    }
+    let mut result = Vec::new();
+    for entry in fs::read_dir(path)? {
+        if cancelled() {
+            return Ok(None);
+        }
+        let entry = entry?;
+        result.push(DirectoryMetadataEntry {
+            name: entry.file_name(),
+            metadata: metadata_of_path(&entry.path()).map(NodeMetadata::from),
+        });
+    }
+    Ok(Some(result))
 }
 
 impl From<Metadata> for NodeMetadata {
@@ -245,6 +308,119 @@ pub fn walk_it<F: Fn() -> bool + Send + Sync>(walk_data: &WalkData<'_, F>) -> Op
 /// Note: this function will create a Node for the given path even if it's
 /// missing or inaccessible, but the metadata will be None in that case.
 fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>) -> Option<Node> {
+    #[cfg(target_os = "macos")]
+    {
+        walk_darwin(
+            path,
+            metadata_of_path(path).map(NodeMetadata::from),
+            walk_data,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        walk_portable(path, walk_data)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn walk_darwin<F: Fn() -> bool + Send + Sync>(
+    path: &Path,
+    metadata: Option<NodeMetadata>,
+    walk_data: &WalkData<'_, F>,
+) -> Option<Node> {
+    if walk_data.is_cancelled() {
+        return None;
+    }
+    if metadata.as_ref().map(|meta| meta.r#type) != Some(NodeFileType::Dir) {
+        walk_data.num_files.fetch_add(1, Ordering::Relaxed);
+        return Some(Node {
+            children: vec![],
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into(),
+            metadata,
+        });
+    }
+    let entries =
+        match darwin::read_directory(path, walk_data.need_metadata, || walk_data.is_cancelled()) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return None,
+            // Unsupported volumes, per-entry errors and directory replacement races
+            // restart the directory with the existing reader. It stats the path again
+            // so a directory replaced with a symlink is never recursively followed.
+            Err(_) => return walk_portable(path, walk_data),
+        };
+    walk_data.num_dirs.fetch_add(1, Ordering::Relaxed);
+    let mut directories = Vec::new();
+    let mut children = Vec::with_capacity(entries.len());
+    let mut files = 0;
+    for entry in entries {
+        if walk_data.is_cancelled() {
+            return None;
+        }
+        let child_path = path.join(&entry.name);
+        if walk_data.should_ignore(&child_path) {
+            continue;
+        }
+        if entry.kind == NodeFileType::Dir {
+            directories.push((child_path, entry.metadata));
+        } else {
+            files += 1;
+            children.push(Node {
+                children: vec![],
+                name: entry.name.to_string_lossy().into(),
+                metadata: if walk_data.need_metadata {
+                    entry
+                        .metadata
+                        .or_else(|| metadata_of_path(&child_path).map(NodeMetadata::from))
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    walk_data.num_files.fetch_add(files, Ordering::Relaxed);
+    // Parallelize I/O by directory instead of locking a shared readdir iterator
+    // and scheduling Rayon work for every individual filename.
+    let cancelled = AtomicBool::new(false);
+    let subtrees: Vec<_> = directories
+        .into_par_iter()
+        .filter_map(|(child_path, metadata)| {
+            if walk_data.is_cancelled() {
+                cancelled.store(true, Ordering::Relaxed);
+                return None;
+            }
+            let metadata =
+                metadata.or_else(|| metadata_of_path(&child_path).map(NodeMetadata::from));
+            let subtree = walk_darwin(&child_path, metadata, walk_data);
+            if subtree.is_none() {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            subtree
+        })
+        .collect();
+    if cancelled.load(Ordering::Relaxed) || walk_data.is_cancelled() {
+        return None;
+    }
+    children.extend(subtrees);
+    children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Some(Node {
+        children,
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into(),
+        metadata,
+    })
+}
+
+fn walk_portable<F: Fn() -> bool + Send + Sync>(
+    path: &Path,
+    walk_data: &WalkData<'_, F>,
+) -> Option<Node> {
     let metadata = metadata_of_path(path);
     let children = if metadata.as_ref().map(|x| x.is_dir()).unwrap_or_default() {
         walk_data.num_dirs.fetch_add(1, Ordering::Relaxed);

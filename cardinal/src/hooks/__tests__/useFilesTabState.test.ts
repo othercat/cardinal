@@ -117,8 +117,10 @@ describe('useFilesTabState', () => {
       result.current.onTabChange('files');
     });
     expect(result.current.activeTab).toBe('files');
-    expect(ensureTailValue).toHaveBeenCalledWith('');
-    expect(queueSearch).toHaveBeenCalledWith('', { immediate: true });
+    expect(result.current.searchInputValue).toBe('needle');
+    expect(result.current.directoryInputValue).toBe('scope');
+    expect(ensureTailValue).not.toHaveBeenCalled();
+    expect(queueSearch).not.toHaveBeenCalled();
     expect(resetCursorToTail).not.toHaveBeenCalled();
   });
 

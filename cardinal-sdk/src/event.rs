@@ -25,9 +25,26 @@ impl FsEvent {
     }
 
     pub fn should_rescan(&self, root: &Path) -> bool {
+        if self.flag.intersects(
+            EventFlag::UserDropped | EventFlag::KernelDropped | EventFlag::EventIdsWrapped,
+        ) {
+            return true;
+        }
         match self.flag.scan_type() {
             ScanType::ReScan => true,
-            ScanType::SingleNode | ScanType::Folder if self.path == root => true,
+            ScanType::SingleNode | ScanType::Folder if self.path == root => {
+                // With FileEvents, changing the attributes of an existing root
+                // directory does not invalidate the entire tree.
+                !self.flag.contains(EventFlag::ItemIsDir)
+                    || self.flag.intersects(
+                        EventFlag::ItemCreated
+                            | EventFlag::ItemRemoved
+                            | EventFlag::ItemRenamed
+                            | EventFlag::Mount
+                            | EventFlag::Unmount
+                            | EventFlag::MustScanSubDirs,
+                    )
+            }
             ScanType::SingleNode | ScanType::Folder | ScanType::Nop => false,
         }
     }

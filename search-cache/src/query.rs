@@ -15,7 +15,7 @@ use query_segmentation::query_segmentation;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use regex::RegexBuilder;
 use search_cancel::CancellationToken;
-use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
+use std::{fs::File, io::Read, path::Path};
 
 pub(crate) const CONTENT_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -250,20 +250,38 @@ impl SearchCache {
         matcher: &SegmentMatcherConcrete,
         token: CancellationToken,
     ) -> Option<Vec<SlabIndex>> {
-        let names: BTreeSet<_> = match matcher {
-            SegmentMatcherConcrete::Plain { kind, needle } => match kind {
-                SegmentKind::Substr => NAME_POOL.search_substr(needle, token),
-                SegmentKind::Prefix => NAME_POOL.search_prefix(needle, token),
-                SegmentKind::Suffix => NAME_POOL.search_suffix(needle, token),
-                SegmentKind::Exact => NAME_POOL.search_exact(needle, token),
-            },
-            SegmentMatcherConcrete::Regex { regex } => NAME_POOL.search_regex(regex, token),
-        }?;
-        let mut nodes = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
-            token.is_cancelled_sparse(i)?;
-            if let Some(indices) = self.name_index.get(name) {
-                nodes.extend(indices.iter().copied());
+        token.is_cancelled()?;
+        let indexed_names = match matcher {
+            SegmentMatcherConcrete::Plain {
+                kind: SegmentKind::Prefix,
+                needle,
+            } => Some(NAME_POOL.search_prefix(needle, token)?),
+            SegmentMatcherConcrete::Plain {
+                kind: SegmentKind::Exact,
+                needle,
+            } => Some(NAME_POOL.search_exact(needle, token)?),
+            _ => None,
+        };
+        let mut nodes = Vec::new();
+        if let Some(names) = indexed_names {
+            for (i, name) in names.iter().enumerate() {
+                token.is_cancelled_sparse(i)?;
+                if let Some(indices) = self.name_index.get(name) {
+                    nodes.extend(indices.iter().copied());
+                }
+            }
+        } else {
+            // Scan only live names in this index, not the global interner's
+            // deleted names or names retained from previous scans. Emit IDs
+            // directly instead of allocating a second tree of matching names.
+            for (i, (name, indices)) in self.name_index.iter().enumerate() {
+                token.is_cancelled_sparse(i)?;
+                if matcher.matches(name) {
+                    for &index in indices.iter() {
+                        token.is_cancelled_sparse(nodes.len())?;
+                        nodes.push(index);
+                    }
+                }
             }
         }
         Some(nodes)
@@ -1035,9 +1053,9 @@ impl SearchCache {
         .map(|value| value.get() as i64)
     }
 
-    fn ensure_metadata(&mut self, index: SlabIndex) -> SlabNodeMetadataCompact {
+    pub(crate) fn ensure_metadata(&mut self, index: SlabIndex) -> SlabNodeMetadataCompact {
         let current = self.file_nodes[index].metadata;
-        if current.is_some() {
+        if !current.is_none() {
             return current;
         }
         let path = self

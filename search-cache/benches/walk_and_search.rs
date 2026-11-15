@@ -7,7 +7,7 @@
 //!   BENCH_CORPUS_DIR=/path/to/linux cargo bench -p search-cache
 
 use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
-use search_cache::SearchCache;
+use search_cache::{SearchCache, SortDirection, SortKey};
 use search_cancel::CancellationToken;
 use std::{path::PathBuf, time::Duration};
 
@@ -89,10 +89,37 @@ fn bench_query_files_warm(c: &mut Criterion) {
     group.finish();
 }
 
+// Measures snapshot creation + cancellable sorting, excluding the initial walk.
+// Numeric keys are warm after Criterion's warmup; cold metadata I/O is separate.
+fn bench_indexed_sort(c: &mut Criterion) {
+    let mut cache = SearchCache::walk_fs(&corpus());
+    let indices = cache.search_empty(CancellationToken::noop()).unwrap();
+    let mut group = c.benchmark_group("indexed_sort");
+    for (label, key) in [
+        ("filename", SortKey::Filename),
+        ("full_path", SortKey::FullPath),
+        ("size_warm", SortKey::Size),
+        ("mtime_warm", SortKey::Mtime),
+        ("ctime_warm", SortKey::Ctime),
+    ] {
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                cache
+                    .prepare_sort(&indices, key, CancellationToken::noop())
+                    .unwrap()
+                    .sort(SortDirection::Asc, CancellationToken::noop())
+                    .unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_walk_fs,
     bench_query_files,
-    bench_query_files_warm
+    bench_query_files_warm,
+    bench_indexed_sort
 );
 criterion_main!(benches);

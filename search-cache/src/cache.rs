@@ -1,16 +1,20 @@
+#[path = "event_replay.rs"]
+mod event_replay;
 use crate::{
     FileNodes, NameIndex, SearchOptions, SearchResultNode, SlabIndex, SlabNode,
     SlabNodeMetadataCompact, State, ThinSlab,
     highlight::derive_highlight_terms,
-    persistent::{PersistentStorage, read_cache_from_file, write_cache_to_file},
+    persistent::{
+        PersistentStorage, SnapshotHeader, read_cache_from_file_with_cancel,
+        read_snapshot_header_with_cancel, write_cache_to_file,
+    },
     query_preprocessor::{expand_query_home_dirs, strip_query_quotes},
 };
 use anyhow::{Context, Result, anyhow};
 use cardinal_sdk::{EventFlag, FsEvent, ScanType, current_event_id};
 use cardinal_syntax::{Expr, Filter, FilterKind, Term, optimize_query, parse_query};
-use fswalk::{
-    Node, NodeMetadata, WalkData, should_ignore_path, walk_it, walk_it_without_root_chain,
-};
+pub use event_replay::{EventObservation, EventPlan, EventReplay};
+use fswalk::{Node, NodeMetadata, WalkData, should_ignore_path, walk_it};
 use hashbrown::HashSet;
 use namepool::NamePool;
 use search_cancel::CancellationToken;
@@ -24,7 +28,6 @@ use std::{
     },
     time::Instant,
 };
-use thin_vec::ThinVec;
 use tracing::{debug, info};
 use typed_num::Num;
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick, is_nfd_quick};
@@ -38,9 +41,10 @@ pub struct SearchCache {
     rescan_count: u64,
     pub(crate) name_index: NameIndex,
     stop: &'static AtomicBool,
+    pub(crate) view_changes: Option<crate::live::IndexChanges>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchQuery {
     /// Directory query
     pub directory_query: Option<String>,
@@ -135,46 +139,30 @@ impl SearchCache {
     pub fn try_read_persistent_cache(
         path: &Path,
         cache_path: &Path,
-        current_ignore_paths: &Vec<PathBuf>,
-        current_include_paths: &Vec<PathBuf>,
+        current_ignore_paths: &[PathBuf],
+        current_include_paths: &[PathBuf],
         cancel: &'static AtomicBool,
     ) -> Result<Self> {
-        read_cache_from_file(cache_path)
-            .and_then(|x| {
-                (x.path == path)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent root path: expected: {:?}, actual: {:?}",
-                            path,
-                            &x.path
-                        )
-                    })
-                    .map(|()| x)
-            })
-            .and_then(|x| {
-                (&x.ignore_paths == current_ignore_paths)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent ignore paths: expected: {:?}, actual: {:?}",
-                            &current_ignore_paths,
-                            &x.ignore_paths
-                        )
-                    })
-                    .map(|()| x)
-            })
-            .and_then(|x| {
-                (&x.include_paths == current_include_paths)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent include paths: expected: {:?}, actual: {:?}",
-                            &current_include_paths,
-                            &x.include_paths
-                        )
-                    })
-                    .map(|()| x)
+        let header = read_snapshot_header_with_cancel(cache_path, Some(cancel))?;
+        if !header.matches_configuration(path, current_ignore_paths, current_include_paths) {
+            return Err(anyhow!("Snapshot watch configuration does not match"));
+        }
+        read_cache_from_file_with_cancel(cache_path, Some(cancel))
+            .and_then(|storage| {
+                // An atomic replacement may occur between the cheap probe and
+                // the full read. Recheck the configuration actually decoded.
+                let header = SnapshotHeader {
+                    source_version: 6,
+                    last_event_id: storage.last_event_id,
+                    path: storage.path.clone(),
+                    ignore_paths: storage.ignore_paths.clone(),
+                    include_paths: storage.include_paths.clone(),
+                };
+                if !header.matches_configuration(path, current_ignore_paths, current_include_paths)
+                {
+                    return Err(anyhow!("Snapshot watch configuration changed during load"));
+                }
+                Ok(storage)
             })
             .map(
                 |PersistentStorage {
@@ -287,6 +275,7 @@ impl SearchCache {
             rescan_count,
             name_index,
             stop: cancel,
+            view_changes: None,
         }
     }
 
@@ -310,11 +299,47 @@ impl SearchCache {
             rescan_count: 0,
             name_index: NameIndex::default(),
             stop: cancel,
+            view_changes: None,
         }
     }
 
     pub fn is_noop(&self) -> bool {
         self.file_nodes.is_empty() && self.name_index.is_empty()
+    }
+
+    pub(crate) fn initial_root(
+        path: &Path,
+        ignore: &[PathBuf],
+        include: &[PathBuf],
+        stop: &'static AtomicBool,
+    ) -> (Self, SlabIndex) {
+        // Establish the history cursor before reading any directory. Changes
+        // during enumeration will be replayed after the final batch.
+        let mut cache = Self::noop(path.to_owned(), ignore.to_vec(), include.to_vec(), stop);
+        cache.last_event_id = current_event_id();
+        let root_name = if path == Path::new("/") { "" } else { "/" };
+        let meta = std::fs::symlink_metadata("/")
+            .ok()
+            .map(|m| SlabNodeMetadataCompact::some(m.into()))
+            .unwrap_or_else(SlabNodeMetadataCompact::none);
+        cache.push_node(SlabNode::new(None, NAME_POOL.push(root_name), meta));
+        let watched = cache.create_node_chain(path);
+        (cache, watched)
+    }
+
+    pub(crate) fn append_scan_node(
+        &mut self,
+        parent: SlabIndex,
+        name: &str,
+        metadata: Option<NodeMetadata>,
+    ) -> SlabIndex {
+        let metadata = metadata
+            .map(SlabNodeMetadataCompact::some)
+            .unwrap_or_else(SlabNodeMetadataCompact::none);
+        let name = NAME_POOL.push(name);
+        let id = self.push_node(SlabNode::new(Some(parent), name, metadata));
+        self.file_nodes[parent].children.push(id);
+        id
     }
 
     pub fn search_empty(&self, cancellation_token: CancellationToken) -> Option<Vec<SlabIndex>> {
@@ -523,7 +548,7 @@ impl SearchCache {
     // - We only generate one alternate query line.
     // - A filename that mixes NFC/NFD within the same segment can still be a miss,
     //   depending on which form the matcher ultimately compares against.
-    fn alternate_normalization_query(&self, line: &str) -> Option<String> {
+    pub(crate) fn alternate_normalization_query(&self, line: &str) -> Option<String> {
         let nfd_quick = is_nfd_quick(line.chars());
         let nfc_quick = is_nfc_quick(line.chars());
         let nfd_yes = matches!(nfd_quick, IsNormalized::Yes);
@@ -603,7 +628,10 @@ impl SearchCache {
     fn push_node(&mut self, node: SlabNode) -> SlabIndex {
         let name = node.name();
         let index = self.file_nodes.insert(node);
-        self.name_index.add_index(name, index, &self.file_nodes);
+        if let Some(changes) = &mut self.view_changes {
+            changes.record(index, name);
+        }
+        self.name_index.add_interned(name, index, &self.file_nodes);
         index
     }
 
@@ -672,60 +700,6 @@ impl SearchCache {
         )
     }
 
-    // `Self::scan_path_recursive`function returns index of the constructed node(with metadata provided).
-    // - If path is not under the watch root, None is returned.
-    // - Procedure contains metadata fetching, if metadata fetching failed, None is returned.
-    fn scan_path_recursive(&mut self, path: &Path) -> Option<SlabIndex> {
-        // Ensure path is under the watch root
-        if path.symlink_metadata().err().map(|e| e.kind()) == Some(ErrorKind::NotFound) {
-            self.remove_node_path(path);
-            return None;
-        };
-        if self.should_ignore(path) {
-            return None;
-        }
-        let parent = path.parent().expect(
-            "scan_path_recursive doesn't expected to scan root(should be filtered outside)",
-        );
-        // Ensure node of the path parent is existed
-        let parent = self.create_node_chain(parent);
-        // Remove node(if exists) and do a full rescan
-        if let Some(&old_node) = self.file_nodes[parent]
-            .children
-            .iter()
-            .find(|&&x| path.file_name() == Some(OsStr::new(self.file_nodes[x].name())))
-        {
-            self.remove_node(old_node);
-        }
-        // For incremental data, we need metadata
-        let walk_data = WalkData::new(
-            path,
-            self.file_nodes.ignore_paths(),
-            self.file_nodes.include_paths(),
-            true,
-            || self.stop.load(Ordering::Relaxed),
-        );
-        walk_it_without_root_chain(&walk_data).map(|node| {
-            let node = self.create_node_slab_update_name_index_and_name_pool(Some(parent), &node);
-            // Push the newly created node to the parent's children
-            self.file_nodes[parent].add_children(node);
-            node
-        })
-    }
-
-    // `Self::scan_path_nonrecursive`function returns index of the constructed node.
-    // - If path is not under the watch root, None is returned.
-    // - Procedure contains metadata fetching, if metadata fetching failed, None is returned.
-    #[allow(dead_code)]
-    fn scan_path_nonrecursive(&mut self, path: &Path) -> Option<SlabIndex> {
-        // Ensure path is under the watch root
-        if path.symlink_metadata().err().map(|e| e.kind()) == Some(ErrorKind::NotFound) {
-            self.remove_node_path(path);
-            return None;
-        };
-        Some(self.create_node_chain(path))
-    }
-
     pub fn walk_data<'p>(
         &self,
         phantom1: &'p mut PathBuf,
@@ -737,7 +711,7 @@ impl SearchCache {
         *phantom2 = self.file_nodes.ignore_paths().clone();
         *phantom3 = self.file_nodes.include_paths().clone();
         let stop = self.stop;
-        WalkData::new(phantom1, phantom2, phantom3, false, move || {
+        WalkData::new(phantom1, phantom2, phantom3, true, move || {
             stop.load(Ordering::Relaxed) || scan_cancellation_token.is_cancelled().is_none()
         })
     }
@@ -776,6 +750,10 @@ impl SearchCache {
     fn remove_node(&mut self, index: SlabIndex) {
         fn remove_single_node(cache: &mut SearchCache, index: SlabIndex) {
             if let Some(node) = cache.file_nodes.try_remove(index) {
+                if let Some(changes) = &mut cache.view_changes {
+                    changes.removed_or_modified = true;
+                    changes.record(index, node.name());
+                }
                 let removed = cache.name_index.remove_index(node.name(), index);
                 assert!(removed, "inconsistent name index and node");
             }
@@ -823,7 +801,7 @@ impl SearchCache {
             last_event_id,
             rescan_count,
             name_index,
-            stop: _,
+            ..
         } = self;
         let (path, ignore_paths, include_paths, slab_root, slab) = file_nodes.into_parts();
         let name_index = name_index.into_persistent();
@@ -917,32 +895,14 @@ impl SearchCache {
     }
 
     pub fn handle_fs_events(&mut self, events: Vec<FsEvent>) -> Result<(), HandleFSEError> {
-        let max_event_id = events.iter().map(|e| e.id).max();
-        // If rescan needed, early exit.
-        if events.iter().any(|event| {
-            if event.flag.contains(EventFlag::HistoryDone) {
-                info!("History processing done: {:?}", event);
-            }
-            if event.should_rescan(self.file_nodes.path()) {
-                info!("Event rescan: {:?}", event);
-                true
-            } else {
-                false
-            }
-        }) {
-            self.rescan_count = self.rescan_count.saturating_add(1);
-            return Err(HandleFSEError::Rescan);
-        }
-        for scan_path in scan_paths(events) {
-            info!("Scanning path: {scan_path:?}");
-            let folder = self.scan_path_recursive(&scan_path);
-            if folder.is_some() {
-                info!("Node changed: {folder:?}");
-            }
-        }
-        if let Some(max_event_id) = max_event_id {
-            self.update_last_event_id(max_event_id);
-        }
+        let plan = self.plan_events(&events)?;
+        let stop = self.stop;
+        plan.read(
+            || stop.load(Ordering::Relaxed),
+            |change| {
+                self.apply_observation(change);
+            },
+        );
         Ok(())
     }
 }
@@ -955,49 +915,12 @@ fn path_segment_matches(name: &str, segment: &OsStr, case_insensitive: bool) -> 
     }
 }
 
-/// Compute the minimal set of paths that must be rescanned for a batch of FsEvents.
-///
-/// Goals:
-/// 1. Filter out events that do not require incremental rescans (e.g. `ReScan` / `Nop` variants
-///    such as RootChanged or HistoryDone). Higher-level logic either rebuilds the cache or simply
-///    updates the event id for those.
-/// 2. Keep only `ScanType::SingleNode` and `ScanType::Folder` paths.
-/// 3. Deduplicate ancestors and descendants:
-///    - Skip a path if it is already covered by an ancestor (`path.starts_with(ancestor)`).
-///    - When inserting an ancestor, remove all of its descendants that were previously added.
-///    - Keep only a single entry for identical paths; later duplicates are considered covered.
-/// 4. Return the minimal cover—the smallest set of paths whose rescans still cover every change.
-///
-/// Usage:
-/// - `SearchCache::handle_fs_events` iterates over the returned paths and calls
-///   `scan_path_recursive` on each of them to avoid redundant rescans of descendants or duplicates.
-/// - High-frequency FSEvents often bubble many changes from the same subtree; merging them here
-///   significantly reduces IO and metadata fetch work downstream.
-///
-/// Complexity:
-/// - Approximately O(n log n + m * depth): sort by depth first, then scan linearly while checking
-///   ancestors.
-/// - If we ever need additional speed we can explore trie/prefix-tree structures.
-///
-/// Corner cases:
-/// - Empty input → returns an empty `Vec`.
-/// - Duplicate identical paths → only one is kept (later duplicates are skipped via `starts_with`).
-/// - Child path seen before its ancestor → the ancestor replaces all children, so only the ancestor remains.
-/// - Ancestor seen before its child → the child is skipped.
-/// - Sibling paths never interfere with each other and are all kept.
-/// - Paths that merely share prefixes (e.g. `/foo/bar` vs `/foo/barista`) are both retained because
-///   `Path::starts_with` compares path components.
-/// - Folder and `SingleNode` events participate together; we only look at the hierarchy.
-/// - `PathBuf` values are compared as-is without normalisation, so symlinks are left untouched—the
-///   caller must provide consistent inputs.
-///
-/// Result:
-/// - Local benchmarks skipped rescans for 173,034 events out of 415,449.
+/// Keep the shallowest paths among structural events. Attribute-only directory
+/// events are handled separately so their children can be updated independently.
 fn scan_paths(events: Vec<FsEvent>) -> Vec<PathBuf> {
     let mut candidates: Vec<(PathBuf, usize)> = events
         .into_iter()
         .filter(|event| {
-            // Sometimes there are ridiculous events assuming dir as file, so we always scan them as folder
             matches!(
                 event.flag.scan_type(),
                 ScanType::SingleNode | ScanType::Folder
@@ -1071,7 +994,7 @@ fn construct_node_slab_name_index(
     unsafe {
         // SAFETY: fswalk sorts each directory's children by name before we recurse,
         // so this preorder traversal visits nodes in lexicographic path order.
-        name_index.add_index_ordered(name, index);
+        name_index.add_interned_ordered(name, index);
     }
     slab[index].children = node
         .children
@@ -1079,33 +1002,6 @@ fn construct_node_slab_name_index(
         .map(|node| construct_node_slab_name_index(Some(index), node, slab, name_index))
         .collect();
     index
-}
-
-impl SearchCache {
-    /// ATTENTION: This function doesn't remove existing node, you should remove it
-    /// before creating the new subtree, or the old subtree nodes will be dangling.
-    ///
-    /// ATTENTION1: This function should only called with Node fetched with metadata.
-    fn create_node_slab_update_name_index_and_name_pool(
-        &mut self,
-        parent: Option<SlabIndex>,
-        node: &Node,
-    ) -> SlabIndex {
-        let metadata = match node.metadata {
-            Some(metadata) => SlabNodeMetadataCompact::some(metadata),
-            // This function should only be called with Node fetched with metadata
-            None => SlabNodeMetadataCompact::unaccessible(),
-        };
-        let name = NAME_POOL.push(&node.name);
-        let slab_node = SlabNode::new(parent, name, metadata);
-        let index = self.push_node(slab_node);
-        self.file_nodes[index].children = node
-            .children
-            .iter()
-            .map(|node| self.create_node_slab_update_name_index_and_name_pool(Some(index), node))
-            .collect::<ThinVec<_>>();
-        index
-    }
 }
 
 pub static NAME_POOL: LazyLock<NamePool> = LazyLock::new(NamePool::new);
@@ -1126,7 +1022,7 @@ fn require_folder_expr(expr: Expr) -> Expr {
 mod tests {
     use super::*;
     use crate::query::CONTENT_BUFFER_BYTES;
-    use fswalk::NodeFileType;
+    use fswalk::{NodeFileType, walk_it_without_root_chain};
     use std::{
         fs,
         path::{Component, Path, PathBuf},
@@ -2588,7 +2484,15 @@ mod tests {
         fs::File::create(root.join("new_dir/file.txt")).expect("Failed to create file");
 
         // Scan the new path with absolute path
-        let result = cache.scan_path_recursive(&root.join("new_dir"));
+        let path = root.join("new_dir");
+        cache
+            .handle_fs_events(vec![FsEvent {
+                path: path.clone(),
+                flag: EventFlag::ItemCreated,
+                id: 1,
+            }])
+            .unwrap();
+        let result = cache.node_index_for_path(&path);
         assert!(result.is_some(), "should successfully scan new directory");
 
         let after_count = cache.file_nodes.len();
@@ -2621,7 +2525,15 @@ mod tests {
         let mut cache = SearchCache::walk_fs(root);
 
         // Try to scan a path that doesn't exist
-        let result = cache.scan_path_recursive(&root.join("existing/nonexistent.txt"));
+        let path = root.join("existing/nonexistent.txt");
+        cache
+            .handle_fs_events(vec![FsEvent {
+                path: path.clone(),
+                flag: EventFlag::ItemRemoved,
+                id: 1,
+            }])
+            .unwrap();
+        let result = cache.node_index_for_path(&path);
         assert!(result.is_none(), "should return None for nonexistent path");
     }
 

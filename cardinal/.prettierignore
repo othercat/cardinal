@@ -3,3 +3,4 @@ node_modules
 /.tauri-build
 /src-tauri/target
 /src-tauri/.cargo
+/src-tauri/gen/schemas

@@ -69,15 +69,16 @@ Cardinal 现在在经典的子串/前缀匹配基础上叠加了 Everything 兼�
 
 ### 环境要求
 
-- macOS 12+
-- Rust 工具链
-- Node.js 18+（附 npm）
+- Apple Silicon（M 系列芯片）Mac，macOS 15.0+
+- `rust-toolchain.toml` 固定的 Rust 工具链
+- Node.js 24（附 npm）
 - Xcode 命令行工具和 Tauri 依赖（<https://tauri.app/start/prerequisites/>）
 
 ### 开发模式
 
 ```bash
 cd cardinal
+npm ci --ignore-scripts
 npm run tauri dev -- --release --features dev
 ```
 
@@ -85,5 +86,7 @@ npm run tauri dev -- --release --features dev
 
 ```bash
 cd cardinal
-npm run tauri build
+npm run tauri build -- --target aarch64-apple-darwin --bundles app
 ```
+
+详细的构建、性能验证与边界见[Apple Silicon 与搜索优化说明](../../docs/apple-silicon-search.md)。

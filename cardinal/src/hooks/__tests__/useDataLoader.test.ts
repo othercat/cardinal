@@ -159,4 +159,90 @@ describe('useDataLoader', () => {
 
     expect(iconUpdateUnlisten).toHaveBeenCalled();
   });
+
+  it('preserves painted rows and fetches only affected cached paths without extracting icons again', async () => {
+    const ids = [11, 22] as SlabIndex[];
+    const { result, rerender } = renderHook(
+      ({ version, path }) =>
+        useDataLoader(ids, version, 1, [{ path, flagBits: 4096, eventId: version, timestamp: 0 }]),
+      { initialProps: { version: 1, path: '/unrelated' } },
+    );
+    await act(async () => {
+      await result.current.ensureRangeLoaded(0, 1);
+    });
+    const cache = result.current.cache;
+    rerender({ version: 2, path: '/unrelated' });
+    await act(async () => {
+      await result.current.ensureRangeLoaded(0, 1);
+    });
+    expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    expect(result.current.cache).toBe(cache);
+    const pending = createDeferred<BuiltNodeInfo[]>();
+    mockedInvoke.mockReturnValueOnce(pending.promise);
+    rerender({ version: 3, path: '/tmp/file-11' });
+    let loading!: Promise<void>;
+    act(() => {
+      loading = result.current.ensureRangeLoaded(0, 1);
+    });
+    expect(result.current.cache).toBe(cache);
+    expect(mockedInvoke).toHaveBeenLastCalledWith('get_nodes_info', {
+      results: [11],
+      includeIcons: false,
+    });
+    await act(async () => {
+      pending.resolve([buildNodeInfo(ids[0])]);
+      await loading;
+    });
+    expect(result.current.cache).toBe(cache);
+  });
+
+  it('does not release a newer batch when an older request for the same ID completes', async () => {
+    const ids = [11] as SlabIndex[];
+    const first = createDeferred<BuiltNodeInfo[]>();
+    const second = createDeferred<BuiltNodeInfo[]>();
+    mockedInvoke.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { result, rerender } = renderDataLoader({ results: ids, version: 1 });
+    act(() => {
+      void result.current.ensureRangeLoaded(0, 0);
+    });
+    rerender({ results: ids, version: 2 });
+    act(() => {
+      void result.current.ensureRangeLoaded(0, 0);
+    });
+    await act(async () => {
+      first.resolve([buildNodeInfo(ids[0])]);
+      await first.promise;
+    });
+    await act(async () => {
+      await result.current.ensureRangeLoaded(0, 0);
+    });
+    expect(mockedInvoke).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      second.resolve([buildNodeInfo(ids[0])]);
+      await second.promise;
+    });
+  });
+  it('finishes a slow row read across unrelated indexed revisions', async () => {
+    const ids = [11, 22] as SlabIndex[];
+    const pending = createDeferred<BuiltNodeInfo[]>();
+    mockedInvoke.mockReturnValueOnce(pending.promise);
+    const { result, rerender } = renderHook(
+      ({ version }) => useDataLoader(ids, version, 1, [], [22]),
+      { initialProps: { version: 1 } },
+    );
+    let request!: Promise<void>;
+    act(() => {
+      request = result.current.ensureRangeLoaded(0, 0);
+    });
+    rerender({ version: 2 });
+    await act(async () => {
+      await result.current.ensureRangeLoaded(0, 0);
+    });
+    await act(async () => {
+      pending.resolve([buildNodeInfo(ids[0])]);
+      await request;
+    });
+    expect(result.current.cache.get(ids[0])?.path).toBe('/tmp/file-11');
+    expect(mockedInvoke).toHaveBeenCalledTimes(1);
+  });
 });

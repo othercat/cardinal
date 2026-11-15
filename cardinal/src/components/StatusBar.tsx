@@ -1,12 +1,13 @@
 import React, { useCallback, useRef, useLayoutEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
-import type { AppLifecycleStatus } from '../types/ipc';
+import type { AppLifecycleStatus, MetadataProgress } from '../types/ipc';
 import { useTranslation } from 'react-i18next';
 import { openPreferences } from '../utils/openPreferences';
 
 export type StatusTabKey = 'files' | 'events';
 
 type StatusBarProps = {
+  metadata?: MetadataProgress;
   scannedFiles: number;
   processedEvents: number;
   lifecycleState: AppLifecycleStatus;
@@ -21,12 +22,14 @@ type StatusBarProps = {
 const TABS: StatusTabKey[] = ['files', 'events'];
 
 const LIFECYCLE_META: Record<AppLifecycleStatus, { icon: string; tone: string }> = {
+  LoadingIndex: { icon: '○', tone: 'initializing' },
   Initializing: { icon: '○', tone: 'initializing' },
   Updating: { icon: '◑', tone: 'updating' },
   Ready: { icon: '●', tone: 'ready' },
 };
 
 const StatusBar = ({
+  metadata,
   scannedFiles,
   processedEvents,
   lifecycleState,
@@ -88,7 +91,7 @@ const StatusBar = ({
     : resultsText;
   const lifecycleMeta = LIFECYCLE_META[lifecycleState];
   const lifecycleLabel = t(`statusBar.lifecycle.${lifecycleState}`);
-  const rescanDisabled = lifecycleState === 'Initializing';
+  const rescanDisabled = lifecycleState === 'Initializing' || lifecycleState === 'LoadingIndex';
   const rescanTitle = rescanDisabled
     ? t('statusBar.rescan.disabledHint')
     : t('statusBar.rescan.enabledHint');
@@ -187,6 +190,15 @@ const StatusBar = ({
       </div>
 
       <div className="status-right">
+        {activeTab === 'files' && metadata && metadata.processed < metadata.total && (
+          <span className="status-value">
+            {t('statusBar.metadataProgress', {
+              done: metadata.processed.toLocaleString(),
+              total: metadata.total.toLocaleString(),
+            })}
+          </span>
+        )}
+
         <div className="status-section">
           <span className="status-label">{t('statusBar.searchLabel')}</span>
           <span className="status-value" title={t('statusBar.resultsTitle')}>

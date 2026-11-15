@@ -1,34 +1,37 @@
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+compile_error!("Cardinal requires Apple Silicon and macOS 15 or later.");
+
 mod background;
 mod commands;
 mod lifecycle;
+mod persistence;
 mod quicklook;
 mod search_activity;
 mod sort;
 mod window_controls;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use background::{
     BackgroundLoopChannels, IconPayload, build_search_cache, emit_status_bar_update,
     run_background_event_loop,
 };
 use cardinal_sdk::EventWatcher;
 use commands::{
-    NodeInfoRequest, SearchJob, SearchState, WatchConfigUpdate, activate_main_window,
+    NodeInfoRequest, SearchJob, SearchState, SortJob, WatchConfigUpdate, activate_main_window,
     close_quicklook, copy_files_to_clipboard, get_app_status, get_nodes_info, get_sorted_view,
-    hide_main_window, normalize_watch_config, open_in_finder, open_path, search,
+    get_view_page, hide_main_window, normalize_watch_config, open_in_finder, open_path, search,
     set_tray_activation_policy, set_watch_config, start_logic, toggle_main_window,
     toggle_quicklook, trigger_rescan, update_icon_viewport, update_quicklook,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
-use lifecycle::{
-    APP_QUIT, AppLifecycleState, EXIT_REQUESTED, emit_app_state, load_app_state, update_app_state,
-};
+use lifecycle::{APP_QUIT, AppLifecycleState, EXIT_REQUESTED, emit_app_state, update_app_state};
 use once_cell::sync::OnceCell;
-use search_cache::{SearchCache, SlabIndex};
+use persistence::flush_cache_to_file_once;
+use search_cache::{InitialScan, SearchCache, SlabIndex};
 use search_cancel::CancellationToken;
 use std::{
     path::{Path, PathBuf},
-    sync::{Once, atomic::Ordering},
+    sync::atomic::Ordering,
     time::Duration,
 };
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -39,7 +42,7 @@ use window_controls::{activate_window, hide_window};
 static DB_PATH: OnceCell<PathBuf> = OnceCell::new();
 pub(crate) static LOGIC_START: OnceCell<Sender<LogicStartConfig>> = OnceCell::new();
 pub(crate) const DEFAULT_SYSTEM_IGNORE_PATH: &str = "/System/Volumes/Data";
-const FSE_LATENCY_SECS: f64 = 0.1;
+const FSE_LATENCY_SECS: f64 = 0.025;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LogicStartConfig {
@@ -60,6 +63,7 @@ pub fn run() -> Result<()> {
     let (finish_tx, finish_rx) = bounded::<Sender<Option<SearchCache>>>(1);
     let (search_tx, search_rx) = unbounded::<SearchJob>();
     let (node_info_tx, node_info_rx) = unbounded::<NodeInfoRequest>();
+    let (sort_tx, sort_rx) = unbounded::<SortJob>();
     let (icon_viewport_tx, icon_viewport_rx) = unbounded::<(u64, Vec<SlabIndex>)>();
     let (rescan_tx, rescan_rx) = unbounded::<CancellationToken>();
     let (watch_config_tx, watch_config_rx) = unbounded::<WatchConfigUpdate>();
@@ -116,6 +120,7 @@ pub fn run() -> Result<()> {
         .manage(SearchState::new(
             search_tx,
             node_info_tx,
+            sort_tx,
             icon_viewport_tx.clone(),
             rescan_tx.clone(),
             watch_config_tx.clone(),
@@ -124,6 +129,7 @@ pub fn run() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             search,
             get_nodes_info,
+            get_view_page,
             get_sorted_view,
             update_icon_viewport,
             get_app_status,
@@ -153,6 +159,7 @@ pub fn run() -> Result<()> {
         finish_rx,
         search_rx,
         node_info_rx,
+        sort_rx,
         icon_viewport_rx,
         rescan_rx,
         watch_config_rx,
@@ -240,7 +247,11 @@ fn run_logic_thread(
     let ignore_paths: Vec<_> = ignore_paths.into_iter().map(PathBuf::from).collect();
     let include_paths: Vec<_> = include_paths.into_iter().map(PathBuf::from).collect();
 
-    let mut cache = match SearchCache::try_read_persistent_cache(
+    let mut initial_scan = None;
+    if persistence::has_startup_snapshot(db_path) {
+        update_app_state(app_handle, AppLifecycleState::LoadingIndex);
+    }
+    let mut cache = match persistence::load_startup_cache(
         &path,
         db_path,
         &ignore_paths,
@@ -253,38 +264,46 @@ fn run_logic_thread(
             cached
         }
         Err(e) => {
-            info!("Walking filesystem: {:?}", e);
-            if let Some(cache) = build_search_cache(
-                app_handle,
-                &watch_root,
-                &ignore_paths,
-                &include_paths,
-                CancellationToken::new_scan(),
-            ) {
-                emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
-                cache
-            } else if APP_QUIT.load(Ordering::Relaxed) {
-                info!("Walk filesystem cancelled, app quitting");
-                channels
-                    .finish_rx
-                    .recv()
-                    .expect("Failed to receive finish signal")
-                    .send(None)
-                    .expect("Failed to send None cache");
+            if APP_QUIT.load(Ordering::Relaxed) {
                 return;
-            } else {
-                info!("Initial scan cancelled by newer request, use noop cache");
-                SearchCache::noop(
-                    path.clone(),
-                    ignore_paths.clone(),
-                    include_paths.clone(),
-                    &APP_QUIT,
-                )
+            }
+            update_app_state(app_handle, AppLifecycleState::Initializing);
+            info!("Walking filesystem: {:?}", e);
+            let token = CancellationToken::new_scan();
+            match InitialScan::start(
+                path.clone(),
+                ignore_paths.clone(),
+                include_paths.clone(),
+                &APP_QUIT,
+                token,
+            ) {
+                Ok((cache, scan)) => {
+                    initial_scan = Some(scan);
+                    cache
+                }
+                Err(error) => {
+                    warn!("Directory worker setup failed: {error}");
+                    build_search_cache(
+                        app_handle,
+                        &watch_root,
+                        &ignore_paths,
+                        &include_paths,
+                        token,
+                    )
+                    .unwrap_or_else(|| {
+                        SearchCache::noop(
+                            path.clone(),
+                            ignore_paths.clone(),
+                            include_paths.clone(),
+                            &APP_QUIT,
+                        )
+                    })
+                }
             }
         }
     };
 
-    let event_watcher = if cache.is_noop() {
+    let event_watcher = if initial_scan.is_some() || cache.is_noop() {
         info!("Using noop event watcher due to cancelled initial scan");
         EventWatcher::noop()
     } else {
@@ -305,6 +324,7 @@ fn run_logic_thread(
         app_handle,
         cache,
         event_watcher,
+        initial_scan,
         channels,
         watch_root.to_string(),
         FSE_LATENCY_SECS,
@@ -312,31 +332,6 @@ fn run_logic_thread(
     );
 
     info!("Background thread exited");
-}
-
-fn flush_cache_to_file_once(finish_tx: &Sender<Sender<Option<SearchCache>>>, db_path: &PathBuf) {
-    static FLUSH_ONCE: Once = Once::new();
-    if load_app_state() != AppLifecycleState::Ready {
-        info!("App not fully initialized, skipping cache flush");
-        return;
-    }
-    FLUSH_ONCE.call_once(move || {
-        let (cache_tx, cache_rx) = bounded::<Option<SearchCache>>(1);
-        finish_tx
-            .send(cache_tx)
-            .context("cache_tx is closed")
-            .unwrap();
-        if let Some(cache) = cache_rx.recv().context("cache_tx is closed").unwrap() {
-            cache
-                .flush_to_file(db_path)
-                .context("Failed to write cache to file")
-                .unwrap();
-
-            info!("Cache flushed successfully to {:?}", db_path);
-        } else {
-            info!("Cancelled before data constructed, no cache to flush");
-        }
-    });
 }
 
 fn wait_for_logic_start(rx: Receiver<LogicStartConfig>) -> Option<LogicStartConfig> {

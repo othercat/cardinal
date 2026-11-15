@@ -107,6 +107,7 @@ vi.mock('../hooks/useFileSearch', () => ({
     state: {
       results: [101, 202],
       resultsVersion: 1,
+      queryVersion: 1,
       scannedFiles: 0,
       processedEvents: 0,
       rescanErrors: 0,
@@ -170,12 +171,12 @@ vi.mock('../hooks/useRecentFSEvents', () => ({
 }));
 
 vi.mock('../hooks/useRemoteSort', () => ({
-  DEFAULT_SORTABLE_RESULT_THRESHOLD: 20000,
+  DEFAULT_SORTABLE_RESULT_THRESHOLD: 0,
   useRemoteSort: () => ({
     sortState: null,
     displayedResults: [101, 202],
     displayedResultsVersion: 1,
-    sortThreshold: 20000,
+    sortThreshold: 0,
     setSortThreshold: vi.fn(),
     canSort: true,
     isSorting: false,

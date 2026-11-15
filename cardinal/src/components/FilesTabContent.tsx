@@ -1,3 +1,4 @@
+import type { ResultPages } from '../utils/resultPages';
 import React from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
@@ -9,6 +10,7 @@ import type { VirtualListHandle } from './VirtualList';
 import type { SearchResultItem } from '../types/search';
 import type { SlabIndex } from '../types/slab';
 import type { SortKey, SortState } from '../types/sort';
+import type { FileChangeBatch } from '../types/ipc';
 
 type FilesTabContentProps = {
   headerRef: React.Ref<HTMLDivElement>;
@@ -20,10 +22,14 @@ type FilesTabContentProps = {
   currentDirectoryQuery: string;
   virtualListRef: React.Ref<VirtualListHandle>;
   results: SlabIndex[];
-  // Bumps when backend search results change; useDataLoader treats it as a data-cache reset.
+  pages?: ResultPages;
+  // Committed data epoch. queryVersion resets the cache; live changes revalidate paths.
   dataResultsVersion: number;
   // Bumps when visible ordering changes; VirtualList uses it for viewport-dependent refresh work.
   displayedResultsVersion: number;
+  queryVersion?: number;
+  fileChanges?: FileChangeBatch;
+  changedIds?: readonly number[];
   rowHeight: number;
   overscan: number;
   renderRow: (
@@ -33,6 +39,7 @@ type FilesTabContentProps = {
   ) => ReactNode;
   onScrollSync: (scrollLeft: number) => void;
   sortState: SortState;
+  isSorting?: boolean;
   onSortToggle: (sortKey: SortKey) => void;
   sortDisabled: boolean;
   sortDisabledTooltip: string | null;
@@ -48,13 +55,18 @@ export function FilesTabContent({
   currentDirectoryQuery,
   virtualListRef,
   results,
+  pages,
   dataResultsVersion,
   displayedResultsVersion,
+  queryVersion,
+  fileChanges,
+  changedIds,
   rowHeight,
   overscan,
   renderRow,
   onScrollSync,
   sortState,
+  isSorting,
   onSortToggle,
   sortDisabled,
   sortDisabledTooltip,
@@ -65,6 +77,7 @@ export function FilesTabContent({
         ref={headerRef}
         onResizeStart={onResizeStart}
         onContextMenu={onHeaderContextMenu}
+        isSorting={isSorting}
         sortState={sortState}
         onSortToggle={onSortToggle}
         sortDisabled={sortDisabled}
@@ -82,8 +95,12 @@ export function FilesTabContent({
           <VirtualList
             ref={virtualListRef}
             results={results}
+            pages={pages}
             dataResultsVersion={dataResultsVersion}
             displayedResultsVersion={displayedResultsVersion}
+            queryVersion={queryVersion}
+            fileChanges={fileChanges}
+            changedIds={changedIds}
             rowHeight={rowHeight}
             overscan={overscan}
             renderRow={renderRow}

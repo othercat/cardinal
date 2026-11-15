@@ -28,6 +28,7 @@
     "created": "建立時間"
   },
   "sorting": {
+    "inProgress": "正在排列全部結果",
     "disabled": "排序已停用。結果超過 {{limit}} 個可能影響效能。你可以在偏好設定中調整門檻。"
   },
   "events": {
@@ -55,13 +56,15 @@
     "resetColumnWidths": "重設欄寬"
   },
   "statusBar": {
+    "metadataProgress": "正在補齊大小和時間 {{done}} / {{total}} · 缺值項排在末尾",
     "tabs": {
       "files": "檔案",
       "events": "事件"
     },
     "lifecycle": {
+      "LoadingIndex": "正在讀取已有索引",
       "Initializing": "正在初始化",
-      "Updating": "正在更新",
+      "Updating": "正在同步檔案變更",
       "Ready": "就緒"
     },
     "aria": {
@@ -131,7 +134,7 @@
       "label": "顯示托盤圖示"
     },
     "sortingLimit": {
-      "label": "排序上限"
+      "label": "排序上限（0 表示不限）"
     },
     "save": "儲存",
     "reset": "恢復預設設定",

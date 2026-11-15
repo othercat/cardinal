@@ -277,6 +277,40 @@ fn cancellation_stops_walk_it_without_root_chain() {
     );
 }
 
+#[test]
+fn directory_metadata_is_nonrecursive_and_matches_files_and_symlinks() {
+    let temp = TempDir::new("directory_metadata").unwrap();
+    let path = temp.path();
+    fs::create_dir(path.join("folder")).unwrap();
+    fs::write(path.join("folder/not-a-direct-child.txt"), b"nested").unwrap();
+    fs::write(path.join("file.txt"), vec![b'x'; 513]).unwrap();
+    std::os::unix::fs::symlink(path.join("folder"), path.join("link")).unwrap();
+    let entries = fswalk::read_directory_metadata(path, || false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entries.len(), 3, "the nested file must not be enumerated");
+    let file = entries
+        .iter()
+        .find(|entry| entry.name == "file.txt")
+        .unwrap();
+    let actual = file.metadata.unwrap();
+    let expected = fswalk::NodeMetadata::from(fs::symlink_metadata(path.join("file.txt")).unwrap());
+    assert_eq!(actual.r#type, NodeFileType::File);
+    assert_eq!(actual.size, 513);
+    assert_eq!(actual.ctime, expected.ctime);
+    assert_eq!(actual.mtime, expected.mtime);
+    let link = entries.iter().find(|entry| entry.name == "link").unwrap();
+    let expected = fswalk::NodeMetadata::from(fs::symlink_metadata(path.join("link")).unwrap());
+    assert_eq!(link.metadata.unwrap().r#type, NodeFileType::Symlink);
+    assert_eq!(link.metadata.unwrap().size, expected.size);
+    assert!(fswalk::read_directory_metadata(&path.join("link"), || false).is_err());
+    assert!(
+        fswalk::read_directory_metadata(path, || true)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// `walk_it_without_root_chain` also respects prefix-based ignore.
 #[test]
 fn walk_without_root_chain_respects_prefix_ignore() {

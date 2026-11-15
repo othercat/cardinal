@@ -28,6 +28,7 @@
     "created": "创建时间"
   },
   "sorting": {
+    "inProgress": "正在排列全部结果",
     "disabled": "排序已禁用。结果超过 {{limit}} 个可能影响性能。您可以在偏好设置中调整阈值。"
   },
   "events": {
@@ -55,13 +56,15 @@
     "resetColumnWidths": "重置列宽"
   },
   "statusBar": {
+    "metadataProgress": "正在补齐大小和时间 {{done}} / {{total}} · 缺值项排在末尾",
     "tabs": {
       "files": "文件",
       "events": "事件"
     },
     "lifecycle": {
+      "LoadingIndex": "正在读取已有索引",
       "Initializing": "正在初始化",
-      "Updating": "正在更新",
+      "Updating": "正在同步文件变更",
       "Ready": "就绪"
     },
     "aria": {
@@ -131,7 +134,7 @@
       "label": "显示托盘图标"
     },
     "sortingLimit": {
-      "label": "排序上限"
+      "label": "排序上限（0 表示不限）"
     },
     "save": "保存",
     "reset": "恢复默认设置",

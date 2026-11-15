@@ -32,15 +32,18 @@ impl SortedSlabIndices {
         self.indices.iter()
     }
 
+    pub(crate) fn as_slice(&self) -> &[SlabIndex] {
+        &self.indices
+    }
+
     pub fn insert(&mut self, index: SlabIndex, slab: &FileNodes) {
-        let Some(target_path) = slab.node_path(index) else {
+        if slab.get(index).is_none() {
             return;
-        };
-        if let Err(pos) = self.indices.binary_search_by(|existing| {
-            slab.node_path(*existing)
-                .expect("node in name index must resolve to a path")
-                .cmp(&target_path)
-        }) {
+        }
+        if let Err(pos) = self
+            .indices
+            .binary_search_by(|existing| slab.compare_paths(*existing, index))
+        {
             self.indices.insert(pos, index);
         }
     }
@@ -95,6 +98,10 @@ impl NameIndex {
         self.map.get(name)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&&'static str, &SortedSlabIndices)> {
+        self.map.iter()
+    }
+
     pub fn get_mut(&mut self, name: &str) -> Option<&mut SortedSlabIndices> {
         self.map.get_mut(name)
     }
@@ -103,23 +110,27 @@ impl NameIndex {
     ///
     /// The index must be inserted with it's full path ordered.
     pub unsafe fn add_index_ordered(&mut self, name: &str, index: SlabIndex) {
-        if let Some(existing) = self.map.get_mut(name) {
-            unsafe {
-                existing.insert_ordered(index);
-            }
-        } else {
-            let interned = NAME_POOL.push(name);
-            self.map.insert(interned, SortedSlabIndices::new(index));
+        unsafe {
+            self.add_interned_ordered(NAME_POOL.push(name), index);
         }
     }
 
+    pub(crate) unsafe fn add_interned_ordered(&mut self, name: &'static str, index: SlabIndex) {
+        self.map
+            .entry(name)
+            .and_modify(|bucket| unsafe { bucket.insert_ordered(index) })
+            .or_insert_with(|| SortedSlabIndices::new(index));
+    }
+
     pub fn add_index(&mut self, name: &str, index: SlabIndex, slab: &FileNodes) {
-        if let Some(existing) = self.map.get_mut(name) {
-            existing.insert(index, slab);
-        } else {
-            let interned = NAME_POOL.push(name);
-            self.map.insert(interned, SortedSlabIndices::new(index));
-        }
+        self.add_interned(NAME_POOL.push(name), index, slab);
+    }
+
+    pub(crate) fn add_interned(&mut self, name: &'static str, index: SlabIndex, slab: &FileNodes) {
+        self.map
+            .entry(name)
+            .and_modify(|bucket| bucket.insert(index, slab))
+            .or_insert_with(|| SortedSlabIndices::new(index));
     }
 
     pub fn remove_index(&mut self, name: &str, index: SlabIndex) -> bool {

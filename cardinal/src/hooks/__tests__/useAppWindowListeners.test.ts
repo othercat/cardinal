@@ -1,3 +1,4 @@
+import type { AppLifecycleStatus } from '../../types/ipc';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { RefObject } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,7 +27,7 @@ type HookProps = {
   searchInputRef: RefObject<HTMLInputElement>;
   focusAndSelectSearchInput: () => void;
   handleStatusUpdate: (scannedFiles: number, processedEvents: number, rescanErrors: number) => void;
-  setLifecycleState: (status: 'Initializing' | 'Updating' | 'Ready') => void;
+  setLifecycleState: (status: AppLifecycleStatus) => void;
   submitFilesQuery: (query: string, options?: { immediate?: boolean }) => void;
   setEventFilterQuery: (query: string) => void;
 };
@@ -49,7 +50,7 @@ describe('useAppWindowListeners', () => {
   let statusCallback:
     | ((payload: { scannedFiles: number; processedEvents: number; rescanErrors: number }) => void)
     | null;
-  let lifecycleCallback: ((status: 'Initializing' | 'Updating' | 'Ready') => void) | null;
+  let lifecycleCallback: ((status: AppLifecycleStatus) => void) | null;
   let quickLaunchCallback: (() => void) | null;
   let dragDropCallback: ((event: any) => void) | null;
 

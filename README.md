@@ -69,15 +69,16 @@ Happy searching!
 
 ### Requirements
 
-- macOS 12+
-- Rust toolchain
-- Node.js 18+ with npm
+- Apple Silicon Mac with macOS 15.0+
+- Rust toolchain pinned by `rust-toolchain.toml`
+- Node.js 24 with npm
 - Xcode command-line tools & Tauri prerequisites (<https://tauri.app/start/prerequisites/>)
 
 ### Development mode
 
 ```bash
 cd cardinal
+npm ci --ignore-scripts
 npm run tauri dev -- --release --features dev
 ```
 
@@ -85,5 +86,7 @@ npm run tauri dev -- --release --features dev
 
 ```bash
 cd cardinal
-npm run tauri build
+npm run tauri build -- --target aarch64-apple-darwin --bundles app
 ```
+
+See [the Chinese build and performance notes](docs/apple-silicon-search.md) for validation and remaining performance limits.

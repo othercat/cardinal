@@ -1,4 +1,5 @@
 [build]
+target = "aarch64-apple-darwin"
 rustflags = [
   "-Csymbol-mangling-version=v0",
   # https://doc.rust-lang.org/rustc/codegen-options/index.html#split-debuginfo
@@ -6,6 +7,9 @@ rustflags = [
   # -- currently disabled for test
   # "-Cpanic=abort",
 ]
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"
 
 [unstable]
 # -- currently disabled for test

@@ -1,16 +1,24 @@
+import type { ResultPages } from '../utils/resultPages';
 import { useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { SlabIndex } from '../types/slab';
 
 type UseIconViewportProps = {
   results: SlabIndex[];
+  pages?: ResultPages;
   resultsVersion: number;
   start: number;
   end: number;
 };
 
 // Deduplicates and throttles icon viewport updates to the backend.
-export function useIconViewport({ results, resultsVersion, start, end }: UseIconViewportProps) {
+export function useIconViewport({
+  results,
+  pages,
+  resultsVersion,
+  start,
+  end,
+}: UseIconViewportProps) {
   const requestIdRef = useRef(0);
   const lastRangeRef = useRef<{ start: number; end: number } | null>(null);
   const pendingRef = useRef<SlabIndex[] | null>(null);
@@ -41,9 +49,10 @@ export function useIconViewport({ results, resultsVersion, start, end }: UseIcon
   }, [resultsVersion]);
 
   useEffect(() => {
+    const length = pages?.length ?? results.length;
     const clampedStart = Math.max(0, start);
-    const clampedEnd = Math.min(end, results.length - 1);
-    const hasRange = results.length > 0 && end >= start && clampedEnd >= clampedStart;
+    const clampedEnd = Math.min(end, length - 1);
+    const hasRange = length > 0 && end >= start && clampedEnd >= clampedStart;
 
     // Nothing to send; emit a clear once per empty state.
     if (!hasRange) {
@@ -60,8 +69,21 @@ export function useIconViewport({ results, resultsVersion, start, end }: UseIcon
     }
 
     lastRangeRef.current = { start: clampedStart, end: clampedEnd };
-    scheduleIconViewport(results.slice(clampedStart, clampedEnd + 1));
-  }, [results, start, end, scheduleIconViewport]);
+    if (!pages) {
+      scheduleIconViewport(results.slice(clampedStart, clampedEnd + 1));
+      return;
+    }
+    let stale = false;
+    void pages
+      .range(clampedStart, clampedEnd + 1)
+      .then((ids) => {
+        if (!stale) scheduleIconViewport(ids);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [results, pages, resultsVersion, start, end, scheduleIconViewport]);
 
   useEffect(
     () => () => {

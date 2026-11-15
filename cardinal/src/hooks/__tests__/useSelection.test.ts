@@ -5,6 +5,7 @@ import type { VirtualListHandle } from '../../components/VirtualList';
 import type { SearchResultItem } from '../../types/search';
 import type { SlabIndex } from '../../types/slab';
 import { useSelection } from '../useSelection';
+import type { FileChangeBatch } from '../../types/ipc';
 
 const toSlabIndex = (value: number): SlabIndex => value as SlabIndex;
 
@@ -75,6 +76,76 @@ const renderSelection = (initial: number[], initialVersion = 0) => {
 };
 
 describe('useSelection', () => {
+  it.each([
+    null,
+    [{ path: '/folder', flagBits: 4096 | 131072, eventId: 1, timestamp: 0 }],
+  ] as FileChangeBatch[])(
+    'rejects reused IDs after a full refresh or ancestor scan (%j)',
+    (changes) => {
+      const ids = [1] as SlabIndex[];
+      let path = '/folder/old';
+      const list = createVirtualListRef({ getItem: () => ({ path }) });
+      const { result, rerender } = renderHook(
+        ({ version, events }: { version: number; events: FileChangeBatch }) =>
+          useSelection(ids, 1, list, {
+            queryVersion: 1,
+            dataVersion: version,
+            fileChanges: events,
+          }),
+        { initialProps: { version: 1, events: [] as FileChangeBatch } },
+      );
+      act(() => result.current.selectSingleRow(0));
+      path = '/folder/new';
+      rerender({ version: 2, events: changes });
+      expect(result.current.selectedIndices).toEqual([]);
+      expect(result.current.selectedPaths).toEqual([]);
+      expect(result.current.activeRowIndex).toBeNull();
+    },
+  );
+
+  it('remaps a live selection after insertion and clears it for a new user query', () => {
+    let currentIds = [0, 1, 2] as SlabIndex[];
+    const list = createVirtualListRef({
+      getItem: (index) => ({ path: `/file-${currentIds[index]}` }),
+    });
+    const { result, rerender } = renderHook(
+      ({ ids, version, query }) => {
+        currentIds = ids;
+        return useSelection(ids, version, list, {
+          queryVersion: query,
+          dataVersion: version,
+          fileChanges: [],
+        });
+      },
+      { initialProps: { ids: currentIds, version: 1, query: 1 } },
+    );
+    act(() => result.current.selectSingleRow(1));
+    rerender({ ids: [3, 0, 1, 2] as SlabIndex[], version: 2, query: 1 });
+    expect(result.current.selectedIndices).toEqual([2]);
+    expect(result.current.activeRowIndex).toBe(2);
+    expect(result.current.shiftAnchorIndex).toBe(2);
+    expect(result.current.selectedPaths).toEqual(['/file-1']);
+    rerender({ ids: [3, 0, 1, 2] as SlabIndex[], version: 3, query: 2 });
+    expect(result.current.selectedIndices).toEqual([]);
+  });
+
+  it('drops a removed path even when its slab ID is reused in the same position', () => {
+    const ids = [1] as SlabIndex[];
+    const list = createVirtualListRef({ getItem: () => ({ path: '/old-path' }) });
+    const { result, rerender } = renderHook(
+      ({ version, changes }: { version: number; changes: FileChangeBatch }) =>
+        useSelection(ids, 1, list, { queryVersion: 1, dataVersion: version, fileChanges: changes }),
+      { initialProps: { version: 1, changes: [] as FileChangeBatch } },
+    );
+    act(() => result.current.selectSingleRow(0));
+    rerender({
+      version: 2,
+      changes: [{ path: '/old-path', flagBits: 512, eventId: 1, timestamp: 0 }],
+    });
+    expect(result.current.selectedIndices).toEqual([]);
+    expect(result.current.activeRowIndex).toBeNull();
+  });
+
   it('keeps the original anchor when extending the selection with shift-click', () => {
     const { result, selectRow } = renderSelection([0, 1, 2, 3, 4, 5]);
 

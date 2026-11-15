@@ -1,0 +1,4 @@
+[node]
+# esbuild 使用锁定的 @esbuild/darwin-arm64 二进制；fsevents 自带原生模块。
+# 构建与测试不需要安装脚本，也不在安装时下载未锁定的制品。
+scripts = false

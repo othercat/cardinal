@@ -32,12 +32,6 @@ export function useFilesTabEffects({
 }: UseFilesTabEffectsOptions): void {
   useEffect(() => {
     if (activeTab !== 'files') {
-      clearSelection();
-    }
-  }, [activeTab, clearSelection]);
-
-  useEffect(() => {
-    if (activeTab !== 'files') {
       closeQuickLook();
       return;
     }

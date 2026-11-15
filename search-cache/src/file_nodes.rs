@@ -35,6 +35,33 @@ impl FileNodes {
         self.root
     }
 
+    // Compare path components at the first divergence, without constructing
+    // two full paths on every probe of a same-name bucket.
+    pub(crate) fn compare_paths(&self, mut a: SlabIndex, mut b: SlabIndex) -> std::cmp::Ordering {
+        if a == b {
+            return std::cmp::Ordering::Equal;
+        }
+        if self[a].parent() == self[b].parent() {
+            return self[a].name().cmp(self[b].name());
+        }
+        let depth = |id| std::iter::successors(Some(id), |&i| self[i].parent()).count();
+        let (da, db) = (depth(a), depth(b));
+        for _ in db..da {
+            a = self[a].parent().unwrap();
+        }
+        for _ in da..db {
+            b = self[b].parent().unwrap();
+        }
+        if a == b {
+            return da.cmp(&db);
+        }
+        while self[a].parent() != self[b].parent() {
+            a = self[a].parent().unwrap();
+            b = self[b].parent().unwrap();
+        }
+        self[a].name().cmp(self[b].name())
+    }
+
     pub fn node_path(&self, index: SlabIndex) -> Option<PathBuf> {
         let mut current = index;
         let mut segments = vec![];

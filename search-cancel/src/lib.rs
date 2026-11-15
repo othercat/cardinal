@@ -9,6 +9,8 @@ pub static ACTIVE_SEARCH_VERSION: AtomicU64 = AtomicU64::new(0);
 /// A global atomic identifies the active scanning process version of Cardinal.
 pub static ACTIVE_SCAN_VERSION: AtomicU64 = AtomicU64::new(0);
 
+static ACTIVE_SORT_VERSION: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug)]
 pub struct CancellationToken {
     active_version: &'static AtomicU64,
@@ -29,6 +31,7 @@ impl CancellationToken {
     /// It increments the global search version and returns a token for
     /// that new version, so the caller does not need to specify one.
     pub fn new_search() -> Self {
+        Self::cancel_sort();
         let version = self::ACTIVE_SEARCH_VERSION.fetch_add(1, Ordering::SeqCst) + 1;
         Self {
             version,
@@ -36,7 +39,17 @@ impl CancellationToken {
         }
     }
 
+    /// Background refreshes yield to user queries, and must not cancel a sort
+    /// or a foreground query merely because a filesystem event arrived.
+    pub fn background_search() -> Self {
+        Self {
+            version: ACTIVE_SEARCH_VERSION.load(Ordering::SeqCst),
+            active_version: &ACTIVE_SEARCH_VERSION,
+        }
+    }
+
     pub fn new_scan() -> Self {
+        Self::cancel_sort();
         let version = self::ACTIVE_SCAN_VERSION.fetch_add(1, Ordering::SeqCst) + 1;
         Self {
             version,
@@ -50,6 +63,18 @@ impl CancellationToken {
         } else {
             Some(())
         }
+    }
+
+    pub fn new_sort() -> Self {
+        let version = ACTIVE_SORT_VERSION.fetch_add(1, Ordering::SeqCst) + 1;
+        Self {
+            version,
+            active_version: &ACTIVE_SORT_VERSION,
+        }
+    }
+
+    pub fn cancel_sort() {
+        ACTIVE_SORT_VERSION.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn is_cancelled_sparse(&self, counter: usize) -> Option<()> {
@@ -81,6 +106,35 @@ mod tests {
     fn reset_versions() {
         ACTIVE_SEARCH_VERSION.store(0, Ordering::SeqCst);
         ACTIVE_SCAN_VERSION.store(0, Ordering::SeqCst);
+        ACTIVE_SORT_VERSION.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn new_search_or_sort_cancels_previous_sort_without_cancelling_search() {
+        let _guard = lock_versions();
+        reset_versions();
+        let search = CancellationToken::new_search();
+        let first_sort = CancellationToken::new_sort();
+        let next_sort = CancellationToken::new_sort();
+        assert!(search.is_cancelled().is_some());
+        assert!(first_sort.is_cancelled().is_none());
+        assert!(next_sort.is_cancelled().is_some());
+        let _ = CancellationToken::new_search();
+        assert!(next_sort.is_cancelled().is_none());
+    }
+
+    #[test]
+    fn background_refresh_yields_to_user_queries_without_cancelling_sort() {
+        let _guard = lock_versions();
+        reset_versions();
+        let query = CancellationToken::new_search();
+        let sort = CancellationToken::new_sort();
+        let refresh = CancellationToken::background_search();
+        assert!(query.is_cancelled().is_some());
+        assert!(sort.is_cancelled().is_some());
+        assert!(refresh.is_cancelled().is_some());
+        let _ = CancellationToken::new_search();
+        assert!(refresh.is_cancelled().is_none());
     }
 
     #[test]

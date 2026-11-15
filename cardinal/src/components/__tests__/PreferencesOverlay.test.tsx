@@ -38,6 +38,15 @@ const baseProps = {
 };
 
 describe('PreferencesOverlay', () => {
+  it('allows zero to disable the sorting limit', () => {
+    const onSortThresholdChange = vi.fn();
+    render(<PreferencesOverlay {...baseProps} onSortThresholdChange={onSortThresholdChange} />);
+    fireEvent.change(screen.getByLabelText('preferences.sortingLimit.label'), {
+      target: { value: '0' },
+    });
+    fireEvent.click(screen.getByText('preferences.save'));
+    expect(onSortThresholdChange).toHaveBeenCalledWith(0);
+  });
   it('saves watch root updates via onWatchConfigChange', () => {
     const onWatchConfigChange = vi.fn();
     render(<PreferencesOverlay {...baseProps} onWatchConfigChange={onWatchConfigChange} />);

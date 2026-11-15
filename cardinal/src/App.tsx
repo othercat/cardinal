@@ -42,10 +42,14 @@ function App() {
     handleStatusUpdate,
     setLifecycleState,
     requestRescan,
+    pendingSortRef,
+    activeSortKey,
   } = useFileSearch();
   const {
     results,
     resultsVersion,
+    queryVersion,
+    fileChanges,
     scannedFiles,
     processedEvents,
     rescanErrors,
@@ -74,14 +78,33 @@ function App() {
   const {
     sortState,
     displayedResults,
+    displayedPages,
     displayedResultsVersion,
+    displayedDataVersion,
+    displayedFileChanges,
+    displayedChangedIds,
     sortThreshold,
     setSortThreshold,
     sortDisabledTooltip,
+    isSorting,
     sortButtonsDisabled,
     handleSortToggle,
-  } = useRemoteSort(results, resultsVersion, i18n.language, (limit) =>
-    t('sorting.disabled', { limit }),
+  } = useRemoteSort(
+    results,
+    resultsVersion,
+    i18n.language,
+    (limit) => t('sorting.disabled', { limit }),
+    {
+      queryVersion,
+      fileChanges,
+      pendingSortRef,
+      activeSortKey,
+      viewId: state.viewId,
+      pagedCount: state.pagedCount,
+      sortedEdits: state.sortedEdits,
+      changedIds: state.changedIds,
+      getLoadedWindow: () => virtualListRef.current?.getLoadedWindow?.() ?? null,
+    },
   );
 
   // Centralized selection management for the virtualized files list.
@@ -95,7 +118,12 @@ function App() {
     selectSingleRow,
     clearSelection,
     moveSelection,
-  } = useSelection(displayedResults, displayedResultsVersion, virtualListRef);
+  } = useSelection(displayedResults, displayedResultsVersion, virtualListRef, {
+    queryVersion,
+    dataVersion: displayedDataVersion,
+    fileChanges: displayedFileChanges,
+    pages: displayedPages,
+  });
 
   const navigateFromSearchToResults = useCallback(() => {
     if (displayedResults.length === 0) {
@@ -237,7 +265,7 @@ function App() {
     closeQuickLook,
     updateQuickLook,
     clearSelection,
-    resultsVersion,
+    resultsVersion: queryVersion,
     virtualListRef,
     eventsPanelRef,
   });
@@ -321,7 +349,7 @@ function App() {
   );
 
   const displayState: DisplayState = (() => {
-    if (!initialFetchCompleted) return 'loading';
+    if (!initialFetchCompleted) return lifecycleState === 'LoadingIndex' ? 'restoring' : 'loading';
     if (showLoadingUI) return 'loading';
     if (searchError) return 'error';
     if (results.length === 0) return 'empty';
@@ -394,7 +422,7 @@ function App() {
           onBlur={handleSearchBlur}
         />
         <div className={resultsContainerClassName} style={containerStyle}>
-          {activeTab === 'events' ? (
+          {activeTab === 'events' && (
             <FSEventsPanel
               ref={eventsPanelRef}
               events={filteredEvents}
@@ -404,10 +432,8 @@ function App() {
               searchQuery={eventFilterQuery}
               caseInsensitive={!caseSensitive}
             />
-          ) : (
-            // `dataResultsVersion`: backend result-set changes. This resets row metadata cache.
-            // `displayedResultsVersion`: visible-order/projection changes. This refreshes viewport
-            // work such as icon hydration and frozen-view handoff in VirtualList.
+          )}
+          <div className="files-tab-pane" hidden={activeTab !== 'files'}>
             <FilesTabContent
               headerRef={headerRef}
               onResizeStart={onResizeStart}
@@ -418,20 +444,26 @@ function App() {
               currentDirectoryQuery={currentDirectoryQuery}
               virtualListRef={virtualListRef}
               results={displayedResults}
-              dataResultsVersion={resultsVersion}
+              pages={displayedPages}
+              dataResultsVersion={displayedDataVersion}
               displayedResultsVersion={displayedResultsVersion}
+              queryVersion={queryVersion}
+              fileChanges={displayedFileChanges}
+              changedIds={displayedChangedIds}
               rowHeight={ROW_HEIGHT}
               overscan={OVERSCAN_ROW_COUNT}
               renderRow={renderRow}
               onScrollSync={handleHorizontalSync}
+              isSorting={isSorting}
               sortState={sortState}
               onSortToggle={handleSortToggle}
               sortDisabled={sortButtonsDisabled}
               sortDisabledTooltip={sortDisabledTooltip}
             />
-          )}
+          </div>
         </div>
         <StatusBar
+          metadata={state.metadata}
           scannedFiles={scannedFiles}
           processedEvents={processedEvents}
           lifecycleState={lifecycleState}
